@@ -15,8 +15,8 @@ outputs/
 unsloth_compiled_cache/
 bm25_index.pkl
 
-data/
-cases/
+data/*
+!data/.gitkeep
 training_data.jsonl
 
 .env
