@@ -47,13 +47,20 @@ def train():
         return { "text" : texts, }
 
     dataset = load_dataset("json", data_files="training_data.jsonl", split="train")
-    dataset = dataset.map(formatting_prompts_func, batched = True,)
+    
+    # Perform 90/10 Train/Val split
+    dataset = dataset.train_test_split(test_size=0.1)
+    
+    # Map formatting to both splits
+    dataset["train"] = dataset["train"].map(formatting_prompts_func, batched = True)
+    dataset["test"] = dataset["test"].map(formatting_prompts_func, batched = True)
 
     # 4. Train
     trainer = SFTTrainer(
         model = model,
         tokenizer = tokenizer,
-        train_dataset = dataset,
+        train_dataset = dataset["train"],
+        eval_dataset = dataset["test"],
         dataset_text_field = "text",
         max_seq_length = max_seq_length,
         dataset_num_proc = 2,
@@ -72,6 +79,9 @@ def train():
             lr_scheduler_type = "linear",
             seed = 3407,
             output_dir = "outputs",
+            eval_strategy = "steps",
+            eval_steps = 10,
+            per_device_eval_batch_size = 2,
         ),
     )
 

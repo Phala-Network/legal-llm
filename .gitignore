@@ -13,6 +13,7 @@ chroma_db/
 lora_model/
 outputs/
 unsloth_compiled_cache/
+bm25_index.pkl
 
 data/
 cases/

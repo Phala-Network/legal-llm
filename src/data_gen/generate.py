@@ -2,126 +2,178 @@ import os
 import json
 import random
 import glob
-from openai import OpenAI
-from tqdm import tqdm
 import re
+import argparse
+from typing import List, Dict, Optional
+from tqdm import tqdm
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize client (expects OPENAI_API_KEY env var)
-client = OpenAI()
+class DataGenerator:
+    def __init__(self, data_dir: str = "data", output_file: str = "training_data.jsonl", model: str = "openai/gpt-5.1"):
+        self.data_dir = data_dir
+        self.output_file = output_file
+        self.client = OpenAI()
+        self.model = model
 
-def get_html_text(json_path):
-    html_path = json_path.replace('/json/', '/html/').replace('.json', '.html')
-    if os.path.exists(html_path):
-        try:
-            with open(html_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Simple cleanup
-                clean = re.compile('<.*?>')
-                text = re.sub(clean, ' ', content)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return text
-        except:
-            return ""
-    return ""
-
-def generate_synthetic_data(data_dir="data", output_file="training_data.jsonl", num_samples=10):
-    json_files = glob.glob(os.path.join(data_dir, "**", "json", "*.json"), recursive=True)
-    
-    if not json_files:
-        print("No data files found.")
-        return
-
-    # Sample random cases if we have enough, else take all
-    selected_files = random.sample(json_files, min(num_samples, len(json_files)))
-    
-    with open(output_file, 'w') as out_f:
-        for json_file in tqdm(selected_files):
-            text = get_html_text(json_file)
-            if not text or len(text) < 500:
-                continue
-                
-            # Truncate text to avoid context limits if necessary, though 4o handles 128k
-            # But for cost and speed, let's limit context
-            context_text = text[:8000] 
-            
-            prompt = f"""
-            You are a legal expert helper. I will provide you with the text of a court case.
-            Your task is to generate 3 high-quality training examples based strictly on this case.
-            
-            For each example, provide:
-            1. "question": A challenging question a user might ask.
-            2. "query": A search query the assistant would generate to find relevant case law (formatted as keywords).
-            3. "relevant_context": A specific excerpt from the text that contains the answer.
-            4. "answer": The answer to the question, deriving strictly from the provided context.
-
-            Format the output as a valid JSON list of objects:
-            [
-                {{"question": "...", "query": "...", "relevant_context": "...", "answer": "..."}},
-                ...
-            ]
-            
-            Case Text:
-            {context_text}
-            """
-            
+    def _get_html_text(self, json_path: str) -> str:
+        """Extracts text from the companion HTML file of a JSON metadata file."""
+        html_path = json_path.replace('/json/', '/html/').replace('.json', '.html')
+        if os.path.exists(html_path):
             try:
-                print(f"Generating for {json_file}...")
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant assisting in creating fine-tuning data for a legal LLM."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    response_format={ "type": "json_object" }
-                )
-                
-                content = response.choices[0].message.content
-                # Sometimes legacy models or certain prompts might not return pure JSON despite instruction, 
-                # but "json_object" mode usually enforces it if "JSON" is in prompt.
-                # However, the mode returns a JSON object, I asked for a list. 
-                # It might wrap it in a key. Let's handle parsing.
-                
-                try:
-                    data = json.loads(content)
-                    
-                    pairs = []
-                    if isinstance(data, list):
-                        pairs = data
-                    elif isinstance(data, dict):
-                        # look for any list value
-                        for k, v in data.items():
-                            if isinstance(v, list):
-                                pairs = v
-                                break
-                    
-                    print(f"Parsed pairs: {pairs}")
-                    for pair in pairs:
-                        print(f"Keys found: {pair.keys()}")
-                        if "question" in pair and "answer" in pair and "query" in pair and "relevant_context" in pair:
-                            # Create Multi-turn format for Agentic RAG
-                            entry = {
-                                "messages": [
-                                    {"role": "user", "content": pair["question"]},
-                                    {"role": "assistant", "content": f"<search>{pair['query']}</search>"},
-                                    {"role": "user", "content": f"Context:\n{pair['relevant_context']}\n\n"},
-                                    {"role": "assistant", "content": pair["answer"]}
-                                ]
-                            }
-                            out_f.write(json.dumps(entry) + "\n")
-                            
-                except json.JSONDecodeError:
-                    print(f"Failed to decode JSON for {json_file}")
-
+                with open(html_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Simple cleanup to remove tags but keep some structure if needed?
+                    # For now, aggressive cleaning as before, but maybe we want to keep <p> later for chunking.
+                    # The current requirement is just text for context.
+                    clean = re.compile('<.*?>')
+                    text = re.sub(clean, ' ', content)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    return text
             except Exception as e:
-                print(f"Error generating for {json_file}: {e}")
+                print(f"Error reading HTML {html_path}: {e}")
+                return ""
+        return ""
+
+    def _generate_candidate(self, context_text: str) -> Optional[List[Dict]]:
+        """Generates candidate training examples from the text."""
+        prompt = f"""
+        You are an expert legal data annotator.
+        Task: Create 3 diverse "Agentic RAG" training examples based on the provided legal text.
+        
+        Structure for each example:
+        1. "question": A user question (mix of specific fact retrieval and multi-hop reasoning).
+        2. "thought": A chain-of-thought explaining what to search for.
+        3. "search_query": The specific keyword query to execute.
+        4. "relevant_context": Verbatim excerpt from the text containing the answer.
+        5. "answer": The final answer derived from the context.
+
+        Case Text (Truncated):
+        {context_text[:6000]}
+
+        Output format: JSON list of objects.
+        """
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant for legal data generation."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={ "type": "json_object" },
+                temperature=0.7
+            )
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            
+            # Normalize to list
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, list):
+                        return v
+            return []
+            
+        except Exception as e:
+            print(f"Generation error: {e}")
+            return None
+
+    def _critic_review(self, example: Dict, context_text: str) -> bool:
+        """
+        Critic Model: Evaluates the quality of a generated example.
+        Returns True if quality is high (>= 4/5), False otherwise.
+        """
+        critic_prompt = f"""
+        Rate this training example on a scale of 1-5 based on:
+        1. Faithfulness: Does the answer strictly follow the context?
+        2. Relevance: Is the search query a good keyword representation of the question?
+        3. Complexity: Is the question non-trivial?
+
+        Example:
+        Question: {example.get('question')}
+        Thought: {example.get('thought')}
+        Search: {example.get('search_query')}
+        Answer: {example.get('answer')}
+        Context Snippet: {example.get('relevant_context')[:200]}...
+
+        Return JSON: {{"score": <int>, "reason": "<string>"}}
+        """
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": critic_prompt}],
+                response_format={ "type": "json_object" },
+                temperature=0.0
+            )
+            grading = json.loads(response.choices[0].message.content)
+            score = grading.get("score", 0)
+            if score >= 4:
+                return True
+            # print(f"Rejected (Score {score}): {grading.get('reason')}")
+            return False
+        except Exception:
+            return False
+
+    def run(self, num_samples: int = 10):
+        json_files = glob.glob(os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True)
+        if not json_files:
+            print("No data files found.")
+            return
+
+        selected_files = random.sample(json_files, min(num_samples, len(json_files)))
+        
+        valid_count = 0
+        with open(self.output_file, 'w') as out_f:
+            for json_file in tqdm(selected_files, desc="Generating Data"):
+                print(f"Processing {json_file}...")
+                text = self._get_html_text(json_file)
+                if not text or len(text) < 500:
+                    print(f"Skipping {json_file}: text too short ({len(text)})")
+                    continue
+
+                print("Generating candidates...")
+                candidates = self._generate_candidate(text)
+                if not candidates:
+                    print("No candidates generated.")
+                    continue
+
+                for cand in candidates:
+                    print(" reviewing candidate...")
+                    # Validate keys
+                    required_keys = ["question", "thought", "search_query", "relevant_context", "answer"]
+                    if not all(k in cand for k in required_keys):
+                        continue
+
+                    # Critic Loop
+                    if self._critic_review(cand, text):
+                        # Format for Agentic RAG Training (User -> Thought -> Search -> Context -> Answer)
+                        # We represent the Search Tool Call convention.
+                        # Note: This is a simplified "text-based" representation of tool calling.
+                        entry = {
+                            "messages": [
+                                {"role": "user", "content": cand["question"]},
+                                {"role": "assistant", "content": f"<thought>{cand['thought']}</thought>\n<search>{cand['search_query']}</search>"},
+                                # The "tool output" is injected as a User message in many chat formats, or a specific Tool role.
+                                # For simplicity here, we simulate the Search Result return.
+                                {"role": "user", "content": f"Search Results:\n{cand['relevant_context']}\n"},
+                                {"role": "assistant", "content": cand["answer"]}
+                            ]
+                        }
+                        out_f.write(json.dumps(entry) + "\n")
+                        out_f.flush()
+                        valid_count += 1
+
+        print(f"Data Generation Complete. Generated {valid_count} high-quality examples.")
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_samples", type=int, default=10)
     args = parser.parse_args()
     
-    generate_synthetic_data(num_samples=args.num_samples)
+    generator = DataGenerator()
+    generator.run(num_samples=args.num_samples)
