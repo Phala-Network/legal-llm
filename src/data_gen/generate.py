@@ -18,40 +18,41 @@ class DataGenerator:
         self.client = OpenAI()
         self.model = model
 
-    def _get_html_text(self, json_path: str) -> str:
-        """Extracts text from the companion HTML file of a JSON metadata file."""
-        html_path = json_path.replace('/json/', '/html/').replace('.json', '.html')
-        if os.path.exists(html_path):
-            try:
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    # Simple cleanup to remove tags but keep some structure if needed?
-                    # For now, aggressive cleaning as before, but maybe we want to keep <p> later for chunking.
-                    # The current requirement is just text for context.
-                    clean = re.compile('<.*?>')
-                    text = re.sub(clean, ' ', content)
-                    text = re.sub(r'\s+', ' ', text).strip()
-                    return text
-            except Exception as e:
-                print(f"Error reading HTML {html_path}: {e}")
+    def _get_case_text(self, json_path: str) -> str:
+        """Extracts text from the JSON case file."""
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            opinions = data.get('casebody', {}).get('opinions', [])
+            if not opinions:
                 return ""
-        return ""
+            
+            # Combine opinions
+            text = "\n\n".join([op.get('text', '') for op in opinions])
+            return text
+        except Exception as e:
+            print(f"Error reading JSON {json_path}: {e}")
+            return ""
 
     def _generate_candidate(self, context_text: str) -> Optional[List[Dict]]:
         """Generates candidate training examples from the text."""
         prompt = f"""
         You are an expert legal data annotator.
-        Task: Create 3 diverse "Agentic RAG" training examples based on the provided legal text.
+        Task: Create 3 diverse "Agentic RAG" training examples based on the provided legal opinion.
+        
+        The goal is to teach an AI Agent how to research legal cases.
+        The questions should require multi-step reasoning: understanding the facts -> formulating a search -> finding the law.
         
         Structure for each example:
-        1. "question": A user question (mix of specific fact retrieval and multi-hop reasoning).
-        2. "thought": A chain-of-thought explaining what to search for.
-        3. "search_query": The specific keyword query to execute.
+        1. "question": A complex user question (e.g., "Why did the court reverse the decision regarding...").
+        2. "thought": A chain-of-thought explaining the research strategy.
+        3. "search_query": A specific, keyword-optimized search query to find this case or relevant precedence.
         4. "relevant_context": Verbatim excerpt from the text containing the answer.
-        5. "answer": The final answer derived from the context.
+        5. "answer": The final detailed answer derived from the context.
 
         Case Text (Truncated):
-        {context_text[:6000]}
+        {context_text[:8000]}
 
         Output format: JSON list of objects.
         """
@@ -73,6 +74,7 @@ class DataGenerator:
             if isinstance(data, list):
                 return data
             elif isinstance(data, dict):
+                # Handle {"examples": [...]} or similar wrapper
                 for k, v in data.items():
                     if isinstance(v, list):
                         return v
@@ -91,8 +93,8 @@ class DataGenerator:
         Rate this training example on a scale of 1-5 based on:
         1. Faithfulness: Does the answer strictly follow the context?
         2. Relevance: Is the search query a good keyword representation of the question?
-        3. Complexity: Is the question non-trivial?
-
+        3. Complexity: Is the question non-trivial (requires reasoning)?
+        
         Example:
         Question: {example.get('question')}
         Thought: {example.get('thought')}
@@ -114,7 +116,6 @@ class DataGenerator:
             score = grading.get("score", 0)
             if score >= 4:
                 return True
-            # print(f"Rejected (Score {score}): {grading.get('reason')}")
             return False
         except Exception:
             return False
@@ -128,46 +129,45 @@ class DataGenerator:
         selected_files = random.sample(json_files, min(num_samples, len(json_files)))
         
         valid_count = 0
-        with open(self.output_file, 'w') as out_f:
-            for json_file in tqdm(selected_files, desc="Generating Data"):
-                print(f"Processing {json_file}...")
-                text = self._get_html_text(json_file)
-                if not text or len(text) < 500:
-                    print(f"Skipping {json_file}: text too short ({len(text)})")
+        print(f"Starting generation: {len(selected_files)} files selected. Output: {self.output_file}")
+        
+        # Check if file exists to determine if we are appending
+        if os.path.exists(self.output_file):
+            print(f"Appending to existing file: {self.output_file}")
+            
+        for json_file in tqdm(selected_files, desc="Generating Data"):
+            text = self._get_case_text(json_file)
+            if not text or len(text) < 500:
+                continue
+
+            candidates = self._generate_candidate(text)
+            if not candidates:
+                continue
+
+            for cand in candidates:
+                # Validate keys
+                required_keys = ["question", "thought", "search_query", "relevant_context", "answer"]
+                if not all(k in cand for k in required_keys):
                     continue
 
-                print("Generating candidates...")
-                candidates = self._generate_candidate(text)
-                if not candidates:
-                    print("No candidates generated.")
-                    continue
-
-                for cand in candidates:
-                    print(" reviewing candidate...")
-                    # Validate keys
-                    required_keys = ["question", "thought", "search_query", "relevant_context", "answer"]
-                    if not all(k in cand for k in required_keys):
-                        continue
-
-                    # Critic Loop
-                    if self._critic_review(cand, text):
-                        # Format for Agentic RAG Training (User -> Thought -> Search -> Context -> Answer)
-                        # We represent the Search Tool Call convention.
-                        # Note: This is a simplified "text-based" representation of tool calling.
-                        entry = {
-                            "messages": [
-                                {"role": "user", "content": cand["question"]},
-                                {"role": "assistant", "content": f"<thought>{cand['thought']}</thought>\n<search>{cand['search_query']}</search>"},
-                                # The "tool output" is injected as a User message in many chat formats, or a specific Tool role.
-                                # For simplicity here, we simulate the Search Result return.
-                                {"role": "user", "content": f"Search Results:\n{cand['relevant_context']}\n"},
-                                {"role": "assistant", "content": cand["answer"]}
-                            ]
-                        }
+                # Critic Loop
+                if self._critic_review(cand, text):
+                    # Format for Agentic RAG Training
+                    entry = {
+                        "messages": [
+                            {"role": "user", "content": cand["question"]},
+                            {"role": "assistant", "content": f"<thought>{cand['thought']}</thought>\n<search>{cand['search_query']}</search>"},
+                            {"role": "user", "content": f"Search Results:\n{cand['relevant_context']}\n"},
+                            {"role": "assistant", "content": cand["answer"]}
+                        ]
+                    }
+                    
+                    # Write immediately (one-by-one)
+                    with open(self.output_file, 'a', encoding='utf-8') as out_f:
                         out_f.write(json.dumps(entry) + "\n")
-                        out_f.flush()
-                        valid_count += 1
-
+                    
+                    valid_count += 1
+                    
         print(f"Data Generation Complete. Generated {valid_count} high-quality examples.")
 
 if __name__ == "__main__":
