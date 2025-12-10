@@ -2,7 +2,6 @@ import os
 import json
 import random
 import glob
-import re
 import argparse
 from typing import List, Dict, Optional
 from tqdm import tqdm
@@ -35,33 +34,66 @@ class DataGenerator:
             print(f"Error reading JSON {json_path}: {e}")
             return ""
 
-    def _generate_candidate(self, context_text: str) -> Optional[List[Dict]]:
-        """Generates candidate training examples from the text."""
+    def _generate_examples(self, context_text: str) -> List[Dict]:
+        """
+        Generates a mix of training examples from the text in a single pass.
+        Distribution:
+        - 2 Complex "Agentic RAG" examples
+        - 2 Simple QA examples
+        - 1 Negative example
+        """
         prompt = f"""
         You are an expert legal data annotator.
-        Task: Create 3 diverse "Agentic RAG" training examples based on the provided legal opinion.
+        Task: Create 5 diverse training examples based on the provided legal opinion.
         
-        The goal is to teach an AI Agent how to research legal cases.
-        The questions should require multi-step reasoning: understanding the facts -> formulating a search -> finding the law.
+        The goal is to create a robust dataset for a Legal AI Assistant.
         
-        Structure for each example:
-        1. "question": A complex user question (e.g., "Why did the court reverse the decision regarding...").
-        2. "thought": A chain-of-thought explaining the research strategy.
-        3. "search_query": A specific, keyword-optimized search query to find this case or relevant precedence.
-        4. "relevant_context": Verbatim excerpt from the text containing the answer.
-        5. "answer": The final detailed answer derived from the context.
+        Distribution of examples to generate:
+        1. [COMPLEX] (Quantity: 2): Multi-step reasoning.
+           - User asks a complex question.
+           - Assistant thinks, searches, and answers.
+        2. [SIMPLE] (Quantity: 2): Direct fact retrieval.
+           - User asks a specific question.
+           - Assistant answers directly and concisely.
+        3. [NEGATIVE] (Quantity: 1): Unanswerable question.
+           - User asks a plausible-sounding legal question that CANNOT be answered from this specific text.
+           - Assistant politely refuses, stating the information is not in the context.
+
+        Structure for [COMPLEX] Example:
+        {{
+            "type": "complex",
+            "question": "...",
+            "thought": "Step-by-step reasoning...",
+            "search_query": "Keywords for search...",
+            "relevant_context": "Verbatim text snippet...",
+            "answer": "Final detailed answer..."
+        }}
+
+        Structure for [SIMPLE] Example:
+        {{
+            "type": "simple",
+            "question": "...",
+            "answer": "Direct answer..."
+        }}
+        
+        Structure for [NEGATIVE] Example:
+        {{
+            "type": "negative",
+            "question": "...",
+            "answer": "I cannot answer this question based on the provided text, as it does not discuss [task/topic]."
+        }}
 
         Case Text (Truncated):
-        {context_text[:8000]}
+        {context_text[:15000]}
 
-        Output format: JSON list of objects.
+        Output format: A pure JSON list of objects.
         """
         
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant for legal data generation."},
+                    {"role": "system", "content": "You are a helpful and strict data annotation assistant. Output valid JSON only."},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={ "type": "json_object" },
@@ -82,43 +114,7 @@ class DataGenerator:
             
         except Exception as e:
             print(f"Generation error: {e}")
-            return None
-
-    def _critic_review(self, example: Dict, context_text: str) -> bool:
-        """
-        Critic Model: Evaluates the quality of a generated example.
-        Returns True if quality is high (>= 4/5), False otherwise.
-        """
-        critic_prompt = f"""
-        Rate this training example on a scale of 1-5 based on:
-        1. Faithfulness: Does the answer strictly follow the context?
-        2. Relevance: Is the search query a good keyword representation of the question?
-        3. Complexity: Is the question non-trivial (requires reasoning)?
-        
-        Example:
-        Question: {example.get('question')}
-        Thought: {example.get('thought')}
-        Search: {example.get('search_query')}
-        Answer: {example.get('answer')}
-        Context Snippet: {example.get('relevant_context')[:200]}...
-
-        Return JSON: {{"score": <int>, "reason": "<string>"}}
-        """
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": critic_prompt}],
-                response_format={ "type": "json_object" },
-                temperature=0.0
-            )
-            grading = json.loads(response.choices[0].message.content)
-            score = grading.get("score", 0)
-            if score >= 4:
-                return True
-            return False
-        except Exception:
-            return False
+            return []
 
     def run(self, num_samples: int = 10):
         json_files = glob.glob(os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True)
@@ -140,35 +136,53 @@ class DataGenerator:
             if not text or len(text) < 500:
                 continue
 
-            candidates = self._generate_candidate(text)
-            if not candidates:
-                continue
+            examples = self._generate_examples(text)
+            
+            for ex in examples:
+                try:
+                    entry = None
+                    ex_type = ex.get("type", "simple")
 
-            for cand in candidates:
-                # Validate keys
-                required_keys = ["question", "thought", "search_query", "relevant_context", "answer"]
-                if not all(k in cand for k in required_keys):
-                    continue
+                    if ex_type == "complex":
+                        if not all(k in ex for k in ["question", "thought", "search_query", "relevant_context", "answer"]):
+                            continue
+                        entry = {
+                            "messages": [
+                                {"role": "user", "content": ex["question"]},
+                                {"role": "assistant", "content": f"<thought>{ex['thought']}</thought>\n<search>{ex['search_query']}</search>"},
+                                {"role": "user", "content": f"Search Results:\n{ex['relevant_context']}\n"},
+                                {"role": "assistant", "content": ex["answer"]}
+                            ]
+                        }
+                    
+                    elif ex_type == "simple":
+                        if not all(k in ex for k in ["question", "answer"]):
+                            continue
+                        entry = {
+                            "messages": [
+                                {"role": "user", "content": ex["question"]},
+                                {"role": "assistant", "content": ex["answer"]}
+                            ]
+                        }
 
-                # Critic Loop
-                if self._critic_review(cand, text):
-                    # Format for Agentic RAG Training
-                    entry = {
-                        "messages": [
-                            {"role": "user", "content": cand["question"]},
-                            {"role": "assistant", "content": f"<thought>{cand['thought']}</thought>\n<search>{cand['search_query']}</search>"},
-                            {"role": "user", "content": f"Search Results:\n{cand['relevant_context']}\n"},
-                            {"role": "assistant", "content": cand["answer"]}
-                        ]
-                    }
+                    elif ex_type == "negative":
+                        if not all(k in ex for k in ["question", "answer"]):
+                            continue
+                        entry = {
+                            "messages": [
+                                {"role": "user", "content": ex["question"]},
+                                {"role": "assistant", "content": ex["answer"]}
+                            ]
+                        }
+
+                    if entry:
+                        with open(self.output_file, 'a', encoding='utf-8') as out_f:
+                            out_f.write(json.dumps(entry) + "\n")
+                        valid_count += 1
+                except Exception as e:
+                    print(f"Skipping invalid entry: {e}")
                     
-                    # Write immediately (one-by-one)
-                    with open(self.output_file, 'a', encoding='utf-8') as out_f:
-                        out_f.write(json.dumps(entry) + "\n")
-                    
-                    valid_count += 1
-                    
-        print(f"Data Generation Complete. Generated {valid_count} high-quality examples.")
+        print(f"Data Generation Complete. Generated {valid_count} examples.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
