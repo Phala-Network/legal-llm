@@ -10,13 +10,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import concurrent.futures
+import threading
+
 class CaseIngester:
     def __init__(self, data_dir="data", db_path="chroma_db"):
         self.data_dir = data_dir
         self.chroma_client = chromadb.PersistentClient(path=db_path)
         self.client = OpenAI()
-        self.embedding_model_name = "openai/text-embedding-3-large"
+        self.embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "openai/text-embedding-3-large")
         self.collections = {} # Cache loaded collections: name -> collection_obj
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self.collection_lock = threading.Lock()
 
     def get_collection(self, state_name):
         """
@@ -28,18 +33,19 @@ class CaseIngester:
         safe_name = re.sub(r'[^a-zA-Z0-9]', '_', state_name.lower())
         col_name = f"law_cases_{safe_name}"
         
-        if col_name in self.collections:
-            return self.collections[col_name]
-            
-        try:
-            col = self.chroma_client.get_collection(name=col_name)
-            # print(f"Loaded existing collection: {col_name}")
-        except:
-            col = self.chroma_client.create_collection(name=col_name)
-            print(f"Created new collection: {col_name}")
-            
-        self.collections[col_name] = col
-        return col
+        with self.collection_lock:
+            if col_name in self.collections:
+                return self.collections[col_name]
+                
+            try:
+                col = self.chroma_client.get_collection(name=col_name)
+                # print(f"Loaded existing collection: {col_name}")
+            except:
+                col = self.chroma_client.create_collection(name=col_name)
+                print(f"Created new collection: {col_name}")
+                
+            self.collections[col_name] = col
+            return col
 
     def load_case_json(self, file_path):
         """Loads the full JSON case file."""
@@ -119,12 +125,9 @@ class CaseIngester:
         json_files = glob.glob(os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True)
         print(f"Found {len(json_files)} case files.")
         
-        # We need to batch BY COLLECTION to avoid thrashing get_collection, 
-        # or just hold all batches in memory?
-        # Better: Process sequentially but buffer batches per collection.
-        
         batches = {} # "collection_name" -> {ids: [], docs: [], metas: []}
         batch_size = 50
+        futures = []
 
         for json_file in tqdm(json_files):
             try:
@@ -142,12 +145,15 @@ class CaseIngester:
                 # Chunking
                 chunks = self.chunk_text(text, name, date)
                 
-                # Get relevant collection object (just to get the name for batching key)
-                # We won't call get_collection here repeatedly to avoid API spam if it were remote, 
-                # but local is fine. Let's normalize name.
+                # Get relevant collection object
+                # We normalize name to get the key.
                 safe_state_name = re.sub(r'[^a-zA-Z0-9]', '_', jurisdiction.lower())
                 col_key = f"law_cases_{safe_state_name}"
                 
+                # Pre-warm collection safely in main thread
+                # This ensures we don't have race conditions on creation inside the thread
+                self.get_collection(jurisdiction) 
+
                 if col_key not in batches:
                     batches[col_key] = {"ids": [], "docs": [], "metas": []}
                 
@@ -167,8 +173,12 @@ class CaseIngester:
 
                     # Check Batch Size for this collection
                     if len(batches[col_key]["ids"]) >= batch_size:
-                        self._flush_batch(col_key, batches[col_key])
+                        # Submit to executor
+                        # Must copy the data structure because batches[col_key] will be reset
+                        batch_copy = batches[col_key]
                         batches[col_key] = {"ids": [], "docs": [], "metas": []}
+                        
+                        futures.append(self.executor.submit(self._flush_batch, col_key, batch_copy))
 
             except Exception as e:
                 print(f"Skipping {json_file}: {e}")
@@ -176,22 +186,35 @@ class CaseIngester:
         # Final flush
         for col_key, batch_data in batches.items():
             if batch_data["ids"]:
-                self._flush_batch(col_key, batch_data)
+                futures.append(self.executor.submit(self._flush_batch, col_key, batch_data))
+
+        # Wait for all
+        print("Waiting for pending embeddings...")
+        for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+            pass # exceptions are caught in _flush_batch but we could inspect f.result()
+            
+        print("Ingestion complete.")
 
     def _flush_batch(self, col_name, batch_data):
         try:
-            # Route to correct collection (will create if missing)
-            # Need to reverse-map col_name? No, we just use the Key which IS the name.
-            # But we need the 'jurisdiction' string to pass to 'get_collection' logic if we want to be pure
-            # actually we can just use get_collection_by_name direct.
+            # Route to correct collection 
+            # We used get_collection in main thread, so it should be cached or safe to get.
+            # We use the lock just in case if we access the cache.
+            # Actually, we can just call self.chroma_client.get_collection(name=col_name) directly
+            # since we know it exists. But safe to use the helper with lock.
             
-            # Let's fix get_collection to take the direct name if needed or just use the logic inline.
-            # Simplest: Just use the client to get the collection by precise name.
-            try:
-                col = self.chroma_client.get_collection(name=col_name)
-            except:
-                col = self.chroma_client.create_collection(name=col_name)
-                print(f"Created new collection: {col_name}")
+            # Since we modify self.collections in get_collection, let's just use the client directly for speed/safety
+            # assuming it was created. Or simpler: use helper with lock.
+            
+            # However, for massive parallelism, we might want to avoid locking on *read* of the cache if possible.
+            # But the lock is fine for 5 workers.
+            
+            # col = self.get_collection( ... wait we only have the safe name here ... )
+            # We can't reverse engineer the 'State Name' from 'law_cases_state_name' reliably if we want the pretty name,
+            # BUT get_collection only uses the state name to generate the safe name.
+            # If we already have the safe name (col_name), we can just get it from chroma client.
+            
+            col = self.chroma_client.get_collection(name=col_name)
 
             # Generate Embeddings
             resp = self.client.embeddings.create(input=batch_data["docs"], model=self.embedding_model_name)

@@ -6,13 +6,16 @@ from rank_bm25 import BM25Okapi
 import pickle
 import os
 from typing import List, Dict, Any
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class CaseRetriever:
     def __init__(self, db_path="chroma_db", collection_name="law_cases"):
         self.chroma_client = chromadb.PersistentClient(path=db_path)
         self.collection = self.chroma_client.get_collection(name=collection_name)
         self.client = OpenAI()
-        self.embedding_model_name = "openai/text-embedding-3-large"
+        self.embedding_model_name = os.getenv("EMBEDDING_MODEL_NAME", "openai/text-embedding-3-large")
         
         # Reranker
         print("Loading Reranker (this may take a moment first time)...")
@@ -151,8 +154,18 @@ class CaseRetriever:
         return ranked[:k]
 
 if __name__ == "__main__":
-    retriever = CaseRetriever()
-    print("\nTest Retrieval:")
-    results = retriever.retrieve("probation conditions for minors")
-    for r in results:
-        print(f"[{r['rerank_score']:.3f}] {r['metadata'].get('name', 'Unknown')}: {r['text'][:100]}...")
+    # Auto-detect collection
+    temp_client = chromadb.PersistentClient(path="chroma_db")
+    cols = [c.name for c in temp_client.list_collections() if c.name.startswith("law_cases")]
+    
+    if not cols:
+        print("No 'law_cases' collections found.")
+    else:
+        target_col = cols[0]
+        print(f"Connecting to collection: {target_col}")
+        
+        retriever = CaseRetriever(collection_name=target_col)
+        print("\nTest Retrieval:")
+        results = retriever.retrieve("probation conditions for minors")
+        for r in results:
+            print(f"[{r['rerank_score']:.3f}] {r['metadata'].get('name', 'Unknown')}: {r['text'][:100]}...")
