@@ -11,30 +11,35 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class DataGenerator:
-    def __init__(self, data_dir: str = "data", output_file: str = "training_data.jsonl", model: str = "openai/gpt-5.1"):
+    def __init__(self, data_dir: str = "data", output_file: str = "training_data.jsonl", model: Optional[str] = None):
         self.data_dir = data_dir
         self.output_file = output_file
         self.client = OpenAI()
-        self.model = model
+        self.model = model or os.getenv("GENERATION_MODEL", "openai/gpt-5.1")
 
-    def _get_case_text(self, json_path: str) -> str:
-        """Extracts text from the JSON case file."""
+    def _get_case_text(self, json_path: str) -> Dict:
+        """Extracts text and metadata from the JSON case file."""
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
             opinions = data.get('casebody', {}).get('opinions', [])
             if not opinions:
-                return ""
+                return {}
             
             # Combine opinions
             text = "\n\n".join([op.get('text', '') for op in opinions])
-            return text
+            
+            return {
+                "text": text,
+                "id": str(data.get('id', '')),
+                "name": data.get('name_abbreviation', data.get('name', 'Unknown Case'))
+            }
         except Exception as e:
             print(f"Error reading JSON {json_path}: {e}")
-            return ""
+            return {}
 
-    def _generate_examples(self, context_text: str) -> List[Dict]:
+    def _generate_examples(self, case_info: Dict) -> List[Dict]:
         """
         Generates a mix of training examples from the text in a single pass.
         Distribution:
@@ -42,6 +47,10 @@ class DataGenerator:
         - 2 Simple QA examples
         - 1 Negative example
         """
+        context_text = case_info.get("text", "")
+        case_id = case_info.get("id", "unknown")
+        case_name = case_info.get("name", "Unknown Case")
+
         prompt = f"""
         You are an expert legal data annotator.
         Task: Create 5 diverse training examples based on the provided legal opinion.
@@ -52,13 +61,15 @@ class DataGenerator:
         1. [COMPLEX] (Quantity: 2): Multi-step reasoning.
            - User asks a complex question.
            - Assistant thinks, searches, and answers.
+           - IMPORTANT: The assistant MUST cite the case in the final answer using the format: [{case_name}](/cases/{case_id})
         2. [SIMPLE] (Quantity: 2): Direct fact retrieval.
            - User asks a specific question.
            - Assistant answers directly and concisely.
+           - IMPORTANT: The assistant MUST cite the case in the answer using the format: [{case_name}](/cases/{case_id})
         3. [NEGATIVE] (Quantity: 1): Unanswerable question.
            - User asks a plausible-sounding legal question that CANNOT be answered from this specific text.
            - Assistant politely refuses, stating the information is not in the context.
-
+        
         Structure for [COMPLEX] Example:
         {{
             "type": "complex",
@@ -66,14 +77,14 @@ class DataGenerator:
             "thought": "Step-by-step reasoning...",
             "search_query": "Keywords for search...",
             "relevant_context": "Verbatim text snippet...",
-            "answer": "Final detailed answer..."
+            "answer": "Final detailed answer with citation [{case_name}](/cases/{case_id})..."
         }}
 
         Structure for [SIMPLE] Example:
         {{
             "type": "simple",
             "question": "...",
-            "answer": "Direct answer..."
+            "answer": "Direct answer with citation [{case_name}](/cases/{case_id})..."
         }}
         
         Structure for [NEGATIVE] Example:
@@ -82,6 +93,10 @@ class DataGenerator:
             "question": "...",
             "answer": "I cannot answer this question based on the provided text, as it does not discuss [task/topic]."
         }}
+
+        Case Metadata:
+        ID: {case_id}
+        Name: {case_name}
 
         Case Text (Truncated):
         {context_text[:15000]}
@@ -132,11 +147,11 @@ class DataGenerator:
             print(f"Appending to existing file: {self.output_file}")
             
         for json_file in tqdm(selected_files, desc="Generating Data"):
-            text = self._get_case_text(json_file)
-            if not text or len(text) < 500:
+            case_info = self._get_case_text(json_file)
+            if not case_info or len(case_info.get("text", "")) < 500:
                 continue
 
-            examples = self._generate_examples(text)
+            examples = self._generate_examples(case_info)
             
             for ex in examples:
                 try:
@@ -150,7 +165,8 @@ class DataGenerator:
                             "messages": [
                                 {"role": "user", "content": ex["question"]},
                                 {"role": "assistant", "content": f"<thought>{ex['thought']}</thought>\n<search>{ex['search_query']}</search>"},
-                                {"role": "user", "content": f"Search Results:\n{ex['relevant_context']}\n"},
+                                # Inject metadata header into search/context result to match inference format
+                                {"role": "user", "content": f"Search Results:\n[Result 1] {case_info['name']} (ID: {case_info['id']})\n{ex['relevant_context']}\n"},
                                 {"role": "assistant", "content": ex["answer"]}
                             ]
                         }
