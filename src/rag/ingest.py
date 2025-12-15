@@ -162,6 +162,7 @@ class CaseIngester:
                         "name": name,
                         "state": jurisdiction,
                         "citation": citation,
+                        "file_path": json_file,
                         "chunk_index": i
                     })
 
