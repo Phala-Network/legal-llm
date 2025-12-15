@@ -12,6 +12,11 @@ load_dotenv()
 
 import concurrent.futures
 import threading
+import sys
+
+# Add project root to path to ensure imports work if run directly
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.rag.case_parser import CaseParser
 
 class CaseIngester:
     def __init__(self, data_dir="data", db_path="chroma_db"):
@@ -23,6 +28,9 @@ class CaseIngester:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
         self.collection_lock = threading.Lock()
 
+        # Initialize Parser
+        self.parser = CaseParser(data_dir=data_dir)
+
     def get_collection(self, state_name):
         """
         Get or create a collection for a specific state.
@@ -32,18 +40,18 @@ class CaseIngester:
         # "New York" -> law_cases_new_york
         safe_name = re.sub(r'[^a-zA-Z0-9]', '_', state_name.lower())
         col_name = f"law_cases_{safe_name}"
-        
+
         with self.collection_lock:
             if col_name in self.collections:
                 return self.collections[col_name]
-                
+
             try:
                 col = self.chroma_client.get_collection(name=col_name)
                 # print(f"Loaded existing collection: {col_name}")
             except:
                 col = self.chroma_client.create_collection(name=col_name)
                 print(f"Created new collection: {col_name}")
-                
+
             self.collections[col_name] = col
             return col
 
@@ -52,79 +60,68 @@ class CaseIngester:
         with open(file_path, 'r') as f:
             return json.load(f)
 
-    def extract_text_from_json(self, case_data):
-        """Extracts text from the 'casebody' -> 'opinions' structure."""
-        try:
-            opinions = case_data.get('casebody', {}).get('opinions', [])
-            if not opinions:
-                return ""
-            
-            # Combine all opinions (majority, dissenting, etc.)
-            full_text = "\n\n".join([op.get('text', '') for op in opinions])
-            return full_text
-        except Exception as e:
-            print(f"Error extracting text from JSON: {e}")
-            return ""
-
-    def chunk_text(self, text, case_title, decision_date):
+    def chunk_text(self, parsed_data, case_title, decision_date):
         """
         Chunks text by paragraphs with secondary length checks.
-        Prepends context (Case Name, Date) to the valid chunks.
+        Uses parsed structure (Head Matter + Content Blocks).
         """
-        if not text:
-            return []
-
-        # 1. Split by Paragraphs
-        paragraphs = text.split('\n')
-        paragraphs = [p.strip() for p in paragraphs if p.strip()]
-
         chunks = []
-        current_chunk = ""
         target_size = 1000
-        
-        # Context String
-        # e.g. "Context: United Riggers v. Coast Iron (2015-11-23)\n"
         context_str = f"Case: {case_title} ({decision_date})\n"
 
-        for p in paragraphs:
-            # Check potential size
-            if len(current_chunk) + len(p) < target_size:
-                current_chunk += "\n" + p
-            else:
-                # Flush current chunk if it exists
-                if current_chunk:
-                    chunks.append(f"{context_str}{current_chunk.strip()}")
-                
-                # Handle the new paragraph
-                if len(p) > target_size:
-                    # If single paragraph is HUGE, force split by sentences
-                    # Simple heuristic split on ". " to avoid chopping words
-                    # Better would be nltk/spacy but keeping dependencies low
-                    sentences = re.split(r'(?<=[.!?])\s+', p)
-                    sub_chunk = ""
-                    for s in sentences:
-                        if len(sub_chunk) + len(s) < target_size:
-                            sub_chunk += " " + s
-                        else:
-                            chunks.append(f"{context_str}{sub_chunk.strip()}")
-                            sub_chunk = s
-                    if sub_chunk:
-                        current_chunk = sub_chunk # Carry over remainder
-                    else:
-                        current_chunk = ""
+        # Combine head matter and content blocks into a single stream of text segments
+        # We process them sequentially but keep the "Header" logic in mind if we want to improve semantic chunking later.
+        # For now, treat them as a stream of text blocks.
+
+        text_stream = []
+        if parsed_data.get('head_matter'):
+             text_stream.append(f"HEAD MATTER:\n{parsed_data['head_matter']}")
+
+        if parsed_data.get('content_blocks'):
+            text_stream.extend(parsed_data['content_blocks'])
+
+        current_chunk = ""
+
+        for block in text_stream:
+            # Further split block by paragraphs if it's large (CaseParser might return large blocks if no headers found)
+            # Simple assumption: CaseParser returns logical blocks (paragraphs or sections).
+            # But CaseParser right now splits by headers. A section might be huge.
+            # So we stick to the paragraph splitting logic WITHIN each block.
+
+            paragraphs = block.split('\n')
+            paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+            for p in paragraphs:
+                if len(current_chunk) + len(p) < target_size:
+                    current_chunk += "\n" + p
                 else:
-                    current_chunk = p
-        
+                    if current_chunk:
+                        chunks.append(f"{context_str}{current_chunk.strip()}")
+
+                    if len(p) > target_size:
+                        # Split huge single paragraph
+                        sentences = re.split(r'(?<=[.!?])\s+', p)
+                        sub_chunk = ""
+                        for s in sentences:
+                            if len(sub_chunk) + len(s) < target_size:
+                                sub_chunk += " " + s
+                            else:
+                                chunks.append(f"{context_str}{sub_chunk.strip()}")
+                                sub_chunk = s
+                        current_chunk = sub_chunk if sub_chunk else ""
+                    else:
+                        current_chunk = p
+
         if current_chunk:
             chunks.append(f"{context_str}{current_chunk.strip()}")
-            
+
         return chunks
 
     def ingest(self):
         print(f"Scanning {self.data_dir}...")
         json_files = glob.glob(os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True)
         print(f"Found {len(json_files)} case files.")
-        
+
         batches = {} # "collection_name" -> {ids: [], docs: [], metas: []}
         batch_size = 50
         futures = []
@@ -132,7 +129,7 @@ class CaseIngester:
         for json_file in tqdm(json_files):
             try:
                 case_data = self.load_case_json(json_file)
-                
+
                 # Metadata extraction
                 jurisdiction = case_data.get('jurisdiction', {}).get('name_long', 'Unknown')
                 case_id = str(case_data['id'])
@@ -140,27 +137,24 @@ class CaseIngester:
                 date = case_data.get('decision_date', 'Unknown')
                 citation = str(case_data.get('citations', [{}])[0].get('cite', ''))
 
-                text = self.extract_text_from_json(case_data)
-                
+                # USE NEW PARSER
+                parsed_structure = self.parser.parse_case_structure(case_data)
+
                 # Chunking
-                chunks = self.chunk_text(text, name, date)
-                
+                chunks = self.chunk_text(parsed_structure, name, date)
+
                 # Get relevant collection object
-                # We normalize name to get the key.
                 safe_state_name = re.sub(r'[^a-zA-Z0-9]', '_', jurisdiction.lower())
                 col_key = f"law_cases_{safe_state_name}"
-                
-                # Pre-warm collection safely in main thread
-                # This ensures we don't have race conditions on creation inside the thread
-                self.get_collection(jurisdiction) 
+
+                self.get_collection(jurisdiction)
 
                 if col_key not in batches:
                     batches[col_key] = {"ids": [], "docs": [], "metas": []}
-                
+
                 for i, chunk in enumerate(chunks):
-                    # Unique ID
                     doc_id = f"{case_id}_{i}"
-                    
+
                     batches[col_key]["ids"].append(doc_id)
                     batches[col_key]["docs"].append(chunk)
                     batches[col_key]["metas"].append({
@@ -171,55 +165,30 @@ class CaseIngester:
                         "chunk_index": i
                     })
 
-                    # Check Batch Size for this collection
                     if len(batches[col_key]["ids"]) >= batch_size:
-                        # Submit to executor
-                        # Must copy the data structure because batches[col_key] will be reset
                         batch_copy = batches[col_key]
                         batches[col_key] = {"ids": [], "docs": [], "metas": []}
-                        
                         futures.append(self.executor.submit(self._flush_batch, col_key, batch_copy))
 
             except Exception as e:
                 print(f"Skipping {json_file}: {e}")
 
-        # Final flush
         for col_key, batch_data in batches.items():
             if batch_data["ids"]:
                 futures.append(self.executor.submit(self._flush_batch, col_key, batch_data))
 
-        # Wait for all
         print("Waiting for pending embeddings...")
         for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
-            pass # exceptions are caught in _flush_batch but we could inspect f.result()
-            
+            pass
+
         print("Ingestion complete.")
 
     def _flush_batch(self, col_name, batch_data):
         try:
-            # Route to correct collection 
-            # We used get_collection in main thread, so it should be cached or safe to get.
-            # We use the lock just in case if we access the cache.
-            # Actually, we can just call self.chroma_client.get_collection(name=col_name) directly
-            # since we know it exists. But safe to use the helper with lock.
-            
-            # Since we modify self.collections in get_collection, let's just use the client directly for speed/safety
-            # assuming it was created. Or simpler: use helper with lock.
-            
-            # However, for massive parallelism, we might want to avoid locking on *read* of the cache if possible.
-            # But the lock is fine for 5 workers.
-            
-            # col = self.get_collection( ... wait we only have the safe name here ... )
-            # We can't reverse engineer the 'State Name' from 'law_cases_state_name' reliably if we want the pretty name,
-            # BUT get_collection only uses the state name to generate the safe name.
-            # If we already have the safe name (col_name), we can just get it from chroma client.
-            
             col = self.chroma_client.get_collection(name=col_name)
-
-            # Generate Embeddings
             resp = self.client.embeddings.create(input=batch_data["docs"], model=self.embedding_model_name)
             embeddings = [d.embedding for d in resp.data]
-            
+
             col.upsert(
                 ids=batch_data["ids"],
                 documents=batch_data["docs"],
