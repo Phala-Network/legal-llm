@@ -17,6 +17,7 @@ bm25_index.pkl
 
 data/*
 !data/.gitkeep
+processed_files.txt
 training_data.jsonl
 
 .env
