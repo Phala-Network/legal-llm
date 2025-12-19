@@ -7,7 +7,7 @@ class CaseParser:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
         # Regex for Roman numeral headers (e.g., "I.\n", "IV.\n")
-        self.header_pattern = re.compile(r'^[IVXLCDM]+\.\s*$', re.MULTILINE)
+        self.header_pattern = re.compile(r"^[IVXLCDM]+\.\s*$", re.MULTILINE)
 
     def get_local_path(self, case_path: str) -> str:
         """
@@ -15,10 +15,10 @@ class CaseParser:
         Assumes local structure: data_dir/{volume}/json/{case}.json
         """
         # Remove leading slash
-        if case_path.startswith('/'):
+        if case_path.startswith("/"):
             case_path = case_path[1:]
 
-        parts = case_path.split('/')
+        parts = case_path.split("/")
         # Logic from scan_cases.py: parts[0] is reporter (cal-rptr-3d), parts[1] is vol, parts[2] is case
         if len(parts) >= 3:
             # We assume the parts[0] is the reporter folder which might or might not be in data_dir directly.
@@ -45,13 +45,15 @@ class CaseParser:
             # Robust check:
             # Check if parts[0] exists in data_dir
             candidate = os.path.join(
-                self.data_dir, parts[0], parts[1], "json", f"{parts[2]}.json")
+                self.data_dir, parts[0], parts[1], "json", f"{parts[2]}.json"
+            )
             if os.path.exists(candidate):
                 return candidate
 
             # Maybe data_dir IS the reporter dir?
             candidate_nested = os.path.join(
-                self.data_dir, parts[1], "json", f"{parts[2]}.json")
+                self.data_dir, parts[1], "json", f"{parts[2]}.json"
+            )
             if os.path.exists(candidate_nested):
                 return candidate_nested
 
@@ -67,24 +69,24 @@ class CaseParser:
             "head_matter": "",
             "cites_to": [],
             # List of {"type": "header"|"paragraph", "text": "..."}
-            "structured_content": []
+            "structured_content": [],
         }
 
         # 1. Head Matter
-        hm = case_data.get('casebody', {}).get('head_matter')
+        hm = case_data.get("casebody", {}).get("head_matter")
         if hm and hm.strip():
             result["head_matter"] = hm.strip()
 
         # 2. Cites
-        result["cites_to"] = case_data.get('cites_to', [])
+        result["cites_to"] = case_data.get("cites_to", [])
 
         # 3. Opinions
-        opinions = case_data.get('casebody', {}).get('opinions', [])
+        opinions = case_data.get("casebody", {}).get("opinions", [])
 
         full_text_blocks = []
 
         for op in opinions:
-            text = op.get('text', '')
+            text = op.get("text", "")
             if not text or not text.strip():
                 continue
 
@@ -101,8 +103,7 @@ class CaseParser:
             # Or just mark them as headers.
 
             # If we just split, we get: [pre, I., post, II., post]
-            parts = re.split(r'(^[IVXLCDM]+\.\s*.*$)',
-                             text, flags=re.MULTILINE)
+            parts = re.split(r"(^[IVXLCDM]+\.\s*.*$)", text, flags=re.MULTILINE)
 
             # Clean up empty parts
             parts = [p for p in parts if p.strip()]
@@ -129,7 +130,9 @@ class CaseParser:
         result["content_blocks"] = full_text_blocks
         return result
 
-    def extract_full_text(self, case_data: dict, include_recursive: bool = False, visited: set = None) -> str:
+    def extract_full_text(
+        self, case_data: dict, include_recursive: bool = False, visited: set = None
+    ) -> str:
         """
         Extracts the full text representation.
         If include_recursive is True, it attempts to resolve links and append their content.
@@ -137,7 +140,7 @@ class CaseParser:
         if visited is None:
             visited = set()
 
-        case_id = str(case_data.get('id', ''))
+        case_id = str(case_data.get("id", ""))
         if case_id in visited:
             return ""
         visited.add(case_id)
@@ -160,20 +163,21 @@ class CaseParser:
             cited_texts = []
             for citation in parsed["cites_to"]:
                 # Check case_paths
-                paths = citation.get('case_paths', [])
+                paths = citation.get("case_paths", [])
                 for p in paths:
                     local_p = self.get_local_path(p)
                     if local_p:
                         try:
-                            with open(local_p, 'r') as f:
+                            with open(local_p, "r") as f:
                                 sub_data = json.load(f)
                             sub_text = self.extract_full_text(
-                                sub_data, include_recursive=True, visited=visited)  # Recursion!
+                                sub_data, include_recursive=True, visited=visited
+                            )  # Recursion!
                             if sub_text:
-                                cite_str = citation.get(
-                                    'cite', 'Unknown Citation')
+                                cite_str = citation.get("cite", "Unknown Citation")
                                 cited_texts.append(
-                                    f"\n>>>>> CITED CASE START: {cite_str} <<<<<\n{sub_text}\n>>>>> CITED CASE END <<<<<\n")
+                                    f"\n>>>>> CITED CASE START: {cite_str} <<<<<\n{sub_text}\n>>>>> CITED CASE END <<<<<\n"
+                                )
                                 # Optimization: Only follow one path per citation? Yes, usually pointing to same file.
                                 break
                         except Exception as e:

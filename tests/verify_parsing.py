@@ -5,8 +5,9 @@ import shutil
 import tempfile
 
 # Add project root
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.rag.case_parser import CaseParser
+
 
 def test_case_parser():
     # Setup temp data dir
@@ -28,12 +29,10 @@ def test_case_parser():
             "citation": "200 Cal. 3d 200",
             "casebody": {
                 "head_matter": "Summary of Case B.",
-                "opinions": [
-                    { "text": "Opinion text of Case B." }
-                ]
-            }
+                "opinions": [{"text": "Opinion text of Case B."}],
+            },
         }
-        with open(case_b_path, 'w') as f:
+        with open(case_b_path, "w") as f:
             json.dump(case_b_data, f)
 
         # Create Case A (The citing case)
@@ -64,7 +63,7 @@ def test_case_parser():
         # Adjusting directory structure to match default parser expectations
         os.makedirs(os.path.join(tmp_dir, "vol_b", "000", "json"), exist_ok=True)
         case_b_path_real = os.path.join(tmp_dir, "vol_b", "000", "json", "case_b.json")
-        with open(case_b_path_real, 'w') as f:
+        with open(case_b_path_real, "w") as f:
             json.dump(case_b_data, f)
 
         # Case A Cites Case B
@@ -74,16 +73,13 @@ def test_case_parser():
             "casebody": {
                 "head_matter": "Summary of Case A.",
                 "opinions": [
-                    { "text": "I.\nINTRODUCTION\nThis is Case A opinion text." },
-                    { "text": "II.\nDISCUSSION\nWe cite Case B." }
-                ]
+                    {"text": "I.\nINTRODUCTION\nThis is Case A opinion text."},
+                    {"text": "II.\nDISCUSSION\nWe cite Case B."},
+                ],
             },
             "cites_to": [
-                {
-                    "cite": "200 Cal. 3d 200",
-                    "case_paths": ["/vol_b/000/case_b"]
-                }
-            ]
+                {"cite": "200 Cal. 3d 200", "case_paths": ["/vol_b/000/case_b"]}
+            ],
         }
 
         parser = CaseParser(data_dir=tmp_dir)
@@ -109,6 +105,7 @@ def test_case_parser():
         assert "Opinion text of Case B" in full_text
 
         print("\nSUCCESS: All checks passed!")
+
 
 if __name__ == "__main__":
     test_case_parser()

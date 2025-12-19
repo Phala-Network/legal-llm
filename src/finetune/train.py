@@ -8,8 +8,8 @@ from transformers import TrainingArguments
 def train():
     # --- Configuration ---
     # Model Choice
-    model_name = "unsloth/Llama-3.3-70B-Instruct-bnb-4bit"
-    # model_name = "unsloth/Qwen2.5-72B-Instruct-bnb-4bit"
+    # model_name = "unsloth/Llama-3.3-70B-Instruct-bnb-4bit"
+    model_name = "unsloth/Qwen2.5-72B-Instruct-bnb-4bit"
 
     # H200 allows for much larger context. Legal docs benefit from this.
     max_seq_length = 8192
@@ -55,8 +55,8 @@ def train():
     # Check if chat template is needed
     from unsloth.chat_templates import get_chat_template
 
-    tokenizer = get_chat_template(tokenizer, chat_template="llama-3")
-    # tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
+    # tokenizer = get_chat_template(tokenizer, chat_template="llama-3")
+    tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
 
     def formatting_prompts_func(examples):
         convos = examples["messages"]
