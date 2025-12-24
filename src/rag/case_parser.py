@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from .case_filtering import get_local_path, get_cited_case_paths
 
 
 class CaseParser:
@@ -12,52 +13,8 @@ class CaseParser:
     def get_local_path(self, case_path: str) -> str:
         """
         Converts a case_path like '/cal-rptr-3d/211/0149-01' to a local file path.
-        Assumes local structure: data_dir/{volume}/json/{case}.json
         """
-        # Remove leading slash
-        if case_path.startswith("/"):
-            case_path = case_path[1:]
-
-        parts = case_path.split("/")
-        # Logic from scan_cases.py: parts[0] is reporter (cal-rptr-3d), parts[1] is vol, parts[2] is case
-        if len(parts) >= 3:
-            # We assume the parts[0] is the reporter folder which might or might not be in data_dir directly.
-            # Based on scan_cases.py: BASE_DIR = .../data/cal-rptr-3d/
-            # And inputs are like /cal-rptr-3d/xxxx
-            # So if data_dir is .../data, then we construct join(data_dir, parts[0], parts[1], "json", parts[2] + ".json")
-
-            # However, scan_cases.py assumed BASE_DIR was the reporter dir.
-            # In ingest.py: data_dir="data".
-            # We need to be careful.
-
-            # Let's assume data_dir points to the parent of the reporter folders (e.g. "data")
-            # Or "data" CONTAINS the reporter folders.
-
-            # Let's try to construct it relative to self.data_dir
-            # parts[0] = 'cal-rptr-3d'
-            # parts[1] = volume
-            # parts[2] = case
-
-            # If the user passed data_dir="data", and the file is in "data/cal-rptr-3d/...", it works.
-            # If the user passed data_dir="data/cal-rptr-3d", we need to adjust.
-            # But the 'case_path' includes the reporter name.
-
-            # Robust check:
-            # Check if parts[0] exists in data_dir
-            candidate = os.path.join(
-                self.data_dir, parts[0], parts[1], "json", f"{parts[2]}.json"
-            )
-            if os.path.exists(candidate):
-                return candidate
-
-            # Maybe data_dir IS the reporter dir?
-            candidate_nested = os.path.join(
-                self.data_dir, parts[1], "json", f"{parts[2]}.json"
-            )
-            if os.path.exists(candidate_nested):
-                return candidate_nested
-
-        return None
+        return get_local_path(case_path, self.data_dir)
 
     def parse_case_structure(self, case_data: dict) -> dict:
         """
@@ -161,27 +118,23 @@ class CaseParser:
         # Recursive
         if include_recursive:
             cited_texts = []
-            for citation in parsed["cites_to"]:
-                # Check case_paths
-                paths = citation.get("case_paths", [])
-                for p in paths:
-                    local_p = self.get_local_path(p)
-                    if local_p:
-                        try:
-                            with open(local_p, "r") as f:
-                                sub_data = json.load(f)
-                            sub_text = self.extract_full_text(
-                                sub_data, include_recursive=True, visited=visited
-                            )  # Recursion!
-                            if sub_text:
-                                cite_str = citation.get("cite", "Unknown Citation")
-                                cited_texts.append(
-                                    f"\n>>>>> CITED CASE START: {cite_str} <<<<<\n{sub_text}\n>>>>> CITED CASE END <<<<<\n"
-                                )
-                                # Optimization: Only follow one path per citation? Yes, usually pointing to same file.
-                                break
-                        except Exception as e:
-                            print(f"Error loading cited case {local_p}: {e}")
+            cited_files = get_cited_case_paths(case_data, self.data_dir)
+
+            for local_p in cited_files:
+                try:
+                    with open(local_p, "r") as f:
+                        sub_data = json.load(f)
+                    sub_text = self.extract_full_text(
+                        sub_data, include_recursive=True, visited=visited
+                    )  # Recursion!
+                    if sub_text:
+                        # Find the citation string for this path if possible, or just use filename
+                        # For simplicity in refactor, we just mark it as Cited Case
+                        cited_texts.append(
+                            f"\n>>>>> CITED CASE START: {local_p} <<<<<\n{sub_text}\n>>>>> CITED CASE END <<<<<\n"
+                        )
+                except Exception as e:
+                    print(f"Error loading cited case {local_p}: {e}")
 
             if cited_texts:
                 parts.append("\n--- CITED MATERIALS ---")
