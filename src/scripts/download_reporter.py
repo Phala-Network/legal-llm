@@ -49,7 +49,8 @@ def download_file(url, output_path, show_progress=True):
 
         return True
     except Exception as e:
-        print(f"Error downloading {url}: {e}")
+        if show_progress:
+            print(f"Error downloading {url} to {output_path}: {e}")
         if os.path.exists(output_path):
             os.remove(output_path)
         return False
@@ -166,9 +167,9 @@ def download_single_reporter(
                 if delay > 0:
                     time.sleep(delay)
             else:
-                print(f"  Unzip failed.")
+                print(f"  Unzip failed for {zip_path}")
         else:
-            print(f"  Download failed.")
+            print(f"  Download failed for Volume {vol_num} from {url}")
 
     if show_progress:
         print(f"Done processing {reporter}.")

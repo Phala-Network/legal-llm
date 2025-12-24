@@ -2,6 +2,7 @@ import os
 import json
 import argparse
 import time
+import signal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from download_reporter import download_file, download_single_reporter
@@ -14,8 +15,17 @@ JURISDICTIONS_METADATA_URL = "https://static.case.law/JurisdictionsMetadata.json
 def process_reporter_wrapper(args):
     """Wrapper for download_single_reporter to be used in multiprocess"""
     slug, output_dir, max_volumes, delay, show_progress = args
-    download_single_reporter(slug, output_dir, max_volumes, delay, show_progress)
+    try:
+        download_single_reporter(slug, output_dir, max_volumes, delay, show_progress)
+    except KeyboardInterrupt:
+        # Silently exit on interrupt as parent will handle it
+        pass
     return slug
+
+
+def init_worker():
+    """Initializer to ignore SIGINT in worker processes"""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def main():
@@ -99,12 +109,12 @@ def main():
         # Hide individual progress bars in parallel mode to keep output clean
         show_child_progress = False
 
-        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        executor = ProcessPoolExecutor(
+            max_workers=args.workers, initializer=init_worker
+        )
+        try:
             futures = []
             for slug in reporters_to_process:
-                # Pack arguments for the wrapper
-                # Note: delay is per-process, so it helps rate limit individual workers,
-                # but valid total rate will be delay/workers roughly
                 task_args = (
                     slug,
                     args.output_dir,
@@ -117,6 +127,13 @@ def main():
             # Use tqdm to show overall completion progress
             for _ in tqdm(as_completed(futures), total=len(futures), desc="Reporters"):
                 pass
+        except KeyboardInterrupt:
+            print("\nInterrupted by user. Shutting down workers...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            print("Done.")
+            return
+        finally:
+            executor.shutdown(wait=True)
     else:
         # Sequential processing
         # Show individual progress bars
