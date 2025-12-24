@@ -48,23 +48,34 @@ EMBEDDING_MODEL_NAME=text-embedding-3-large
 
 ## Usage
 
-### 1. Ingest Data
+### 1. Download Data
 
-Place your case law JSONs in `data/` and run the ingester.
+You can download case law data using the provided scripts.
+
+**Download All Reporters (Recommended)**:
+This script downloads metadata and volumes for all available reporters. Supports parallel downloading.
+
+```bash
+# Download all reporters with 4 workers and 0.5s delay
+uv run src/scripts/download_all_reporters.py --output_dir data --workers 4 --delay 0.5
+```
+
+**Download Single Reporter**:
+If you only need a specific reporter.
+
+```bash
+uv run src/scripts/download_reporter.py --reporter cal-rptr-3d --max_volumes 5
+```
+
+### 2. Ingest Data
+
+Place your case law JSONs in `data/` (or wherever you downloaded them) and run the ingester.
 
 ```bash
 uv run src/rag/ingest.py
 ```
 
-### 2. Utility Scripts
-
-#### Download Case Data
-
-Fetch case volumes from `static.case.law`.
-
-```bash
-uv run src/scripts/download_reporter.py --reporter cal-rptr-3d --max_volumes 5
-```
+### 3. Utility Scripts
 
 #### Normalize Citations
 
@@ -74,7 +85,7 @@ If your training data contains file paths instead of IDs, use this to migrate th
 uv run src/scripts/migrate_data_to_id.py --input training_data.jsonl --output training_data_migrated.jsonl
 ```
 
-### 3. Generate Synthetic Data
+### 4. Generate Synthetic Data
 
 Choose between direct generation or the batch pipeline (recommended for large scale).
 
@@ -90,7 +101,7 @@ uv run src/data_gen/generate.py --num_samples 50
 uv run src/data_gen/generate_batch.py --pipeline --num_samples 1000
 ```
 
-### 3. Fine-tune Model
+### 5. Fine-tune Model
 
 Train the model using the generated `training_data.jsonl`.
 
@@ -98,7 +109,7 @@ Train the model using the generated `training_data.jsonl`.
 uv run src/finetune/train.py
 ```
 
-### 4. Run Inference
+### 6. Run Inference
 
 **Option A: Interactive CLI**
 
