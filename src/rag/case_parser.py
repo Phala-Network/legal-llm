@@ -88,14 +88,23 @@ class CaseParser:
         return result
 
     def extract_full_text(
-        self, case_data: dict, include_recursive: bool = False, visited: set = None
+        self,
+        case_data: dict,
+        include_recursive: bool = False,
+        visited: set = None,
+        depth: int = 0,
+        max_depth: int = 1,
     ) -> str:
         """
         Extracts the full text representation.
-        If include_recursive is True, it attempts to resolve links and append their content.
+        If include_recursive is True, it attempts to resolve links and append their content up to max_depth.
         """
         if visited is None:
             visited = set()
+
+        if depth > max_depth:
+            print(f"Depth {depth} exceeded max depth {max_depth}")
+            return ""
 
         case_id = str(case_data.get("id", ""))
         if case_id in visited:
@@ -116,7 +125,7 @@ class CaseParser:
             parts.extend(parsed["content_blocks"])
 
         # Recursive
-        if include_recursive:
+        if include_recursive and depth < max_depth:
             cited_texts = []
             cited_files = get_cited_case_paths(case_data, self.data_dir)
 
@@ -124,9 +133,14 @@ class CaseParser:
                 try:
                     with open(local_p, "r") as f:
                         sub_data = json.load(f)
+
                     sub_text = self.extract_full_text(
-                        sub_data, include_recursive=True, visited=visited
-                    )  # Recursion!
+                        sub_data,
+                        include_recursive=True,
+                        visited=visited,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                    )
                     if sub_text:
                         # Find the citation string for this path if possible, or just use filename
                         # For simplicity in refactor, we just mark it as Cited Case
