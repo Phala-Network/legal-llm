@@ -93,18 +93,7 @@ class DataGenerator(BaseGenerator):
         print(f"\nPipeline {pid} Complete! Data in: {self.output_file}")
 
     def prepare_batch_queries(self, num_samples: int, out_file: str, map_file: str):
-        json_files = glob.glob(
-            os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True
-        )
-        json_files = [
-            f for f in json_files if os.path.abspath(f) not in self.processed_files
-        ]
-        valid_files = []
-        for f in tqdm(json_files[: num_samples * 2], desc="Filtering valid cases"):
-            if len(valid_files) >= num_samples:
-                break
-            if self._is_valid_case(f):
-                valid_files.append(f)
+        valid_files = self.get_valid_case_files(num_samples)
 
         meta = {}
         with open(out_file, "w") as f:
@@ -144,26 +133,7 @@ class DataGenerator(BaseGenerator):
                 case_info = self._get_case_text(q_map[cid])
                 queries = self._parse_queries_output(content)
 
-                items = []
-                for q_item in queries:
-                    search = q_item.get("search_query")
-                    context = ""
-                    if search and self.retriever:
-                        for i, doc in enumerate(self.retriever.retrieve(search, k=3)):
-                            dcid = doc["id"].split("_")[0]
-                            name = doc.get("metadata", {}).get("name", "Unknown")
-                            text = (
-                                self._get_full_recursive_text(doc.get("metadata", {}))
-                                or doc["text"]
-                            )
-                            context += f"[Result {i+1}] {name} (ID: {dcid})\n{text[:3000]}...\n\n"
-                    items.append(
-                        {
-                            "q_item": q_item,
-                            "search_query": search,
-                            "retrieved_context_str": context,
-                        }
-                    )
+                items = self.augment_queries_with_context(queries)
 
                 ans_cid = f"ans-{uuid.uuid4()}"
                 body = {
@@ -208,24 +178,7 @@ class DataGenerator(BaseGenerator):
                         continue
                     item = meta["items"][idx]
 
-                    msgs = [{"role": "user", "content": item["q_item"]["question"]}]
-
-                    # Construct Assistant message (Thought + Search)
-                    if item["search_query"]:
-                        # User updated BaseGenerator to not use <thought> tag, so we use it directly as a "Thought" line if desired
-                        # or just concatenate. For training, keeping it organized is good.
-                        thought_content = ans.get("thought", "").strip()
-                        # If the user wants NO <thought> tag at all, we'll just put it at the top
-                        assistant_msg = f"{thought_content}\n\n<search>{item['search_query']}</search>"
-                        msgs.append({"role": "assistant", "content": assistant_msg})
-                        msgs.append(
-                            {
-                                "role": "user",
-                                "content": f"Search Results:\n{item['retrieved_context_str']}",
-                            }
-                        )
-
-                    msgs.append({"role": "assistant", "content": ans.get("answer")})
+                    msgs = self.construct_final_messages(item, ans)
                     f_out.write(json.dumps({"messages": msgs}) + "\n")
                     count += 1
 

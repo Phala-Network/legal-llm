@@ -16,36 +16,20 @@ from src.data_gen.base_generator import BaseGenerator
 class DataGenerator(BaseGenerator):
     def run(self, num_samples: int = 10):
         self._init_retriever()
-        json_files = glob.glob(
-            os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True
-        )
+        json_files = self.get_valid_case_files(num_samples)
+
         if not json_files:
-            print("No data files found.")
+            print("No valid candidates found.")
             return
 
-        # Pre-filter files to remove empty ones
-        print("Pre-examining files for validity...")
-        valid_files = []
-        for f in tqdm(json_files, desc="Filtering Files"):
-            if self._is_valid_case(f):
-                valid_files.append(f)
-
-        print(f"Found {len(valid_files)} valid cases out of {len(json_files)}.")
-        json_files = valid_files  # Replace with valid list
-
-        json_files = [
-            f for f in json_files if os.path.abspath(f) not in self.processed_files
-        ]
-        print(f"Remaining candidates after filtering history: {len(json_files)}")
-
-        random.shuffle(json_files)
+        print(f"Generating data for {len(json_files)} files...")
 
         valid_count = 0
         pbar = tqdm(total=num_samples, desc="Generating Data")
-        file_idx = 0
-        while valid_count < num_samples and file_idx < len(json_files):
-            json_file = json_files[file_idx]
-            file_idx += 1
+
+        for json_file in json_files:
+            if valid_count >= num_samples:
+                break
 
             case_info = self._get_case_text(json_file)
             prompt = self._construct_query_prompt(case_info)
@@ -63,28 +47,7 @@ class DataGenerator(BaseGenerator):
                 if not queries:
                     continue
 
-                items_to_process = []
-                for q_item in queries:
-                    search_query = q_item.get("search_query")
-                    context_str = ""
-                    if search_query and self.retriever:
-                        retrieved = self.retriever.retrieve(search_query, k=4)
-                        for i, doc in enumerate(retrieved):
-                            cid = doc["id"].split("_")[0]
-                            name = doc.get("metadata", {}).get("name", "Unknown")
-                            text = (
-                                self._get_full_recursive_text(doc.get("metadata", {}))
-                                or doc["text"]
-                            )
-                            context_str += f"[Result {i+1}] {name} (ID: {cid})\n{text[:3000]}...\n\n"
-
-                    items_to_process.append(
-                        {
-                            "q_item": q_item,
-                            "search_query": search_query,
-                            "retrieved_context_str": context_str,
-                        }
-                    )
+                items_to_process = self.augment_queries_with_context(queries)
 
                 ans_prompt = self._construct_answer_prompt(
                     items_to_process, case_info["text"]
@@ -103,23 +66,7 @@ class DataGenerator(BaseGenerator):
                         continue
                     item = items_to_process[idx]
 
-                    messages = [{"role": "user", "content": item["q_item"]["question"]}]
-                    if item["search_query"]:
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": f"<thought>{ans_data.get('thought')}</thought>\n<search>{item['search_query']}</search>",
-                            }
-                        )
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": f"Search Results:\n{item['retrieved_context_str']}",
-                            }
-                        )
-                    messages.append(
-                        {"role": "assistant", "content": ans_data.get("answer")}
-                    )
+                    messages = self.construct_final_messages(item, ans_data)
 
                     with open(self.output_file, "a", encoding="utf-8") as out_f:
                         out_f.write(json.dumps({"messages": messages}) + "\n")
