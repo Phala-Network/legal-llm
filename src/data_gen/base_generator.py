@@ -39,6 +39,27 @@ class BaseGenerator:
         self.parser = CaseParser(data_dir=data_dir)
         self.retriever = None
 
+    def _log_prompt(self, stage: str, prompt: str, response: str):
+        """
+        Logs the prompt and response to a debug file for inspection.
+        """
+        log_file = "generation_debug.log"
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        separator = "=" * 80
+
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n{separator}\n")
+                f.write(f"TIMESTAMP: {timestamp}\n")
+                f.write(f"STAGE: {stage}\n")
+                f.write(f"{separator}\n")
+                f.write(f"PROMPT:\n{prompt}\n")
+                f.write(f"{separator}\n")
+                f.write(f"RESPONSE:\n{response}\n")
+                f.write(f"{separator}\n")
+        except Exception as e:
+            print(f"Failed to write to log file: {e}")
+
     def _init_retriever(self):
         if self.retriever:
             return
@@ -195,24 +216,45 @@ class BaseGenerator:
         case_id = case_info.get("id", "unknown")
         case_name = case_info.get("name", "Unknown Case")
 
+        # Select a random style
+        selected_style = random.choice(self.QUERY_STYLES)
+
+        # Adjust distribution based on complexity bias if needed,
+        # but for now we'll stick to the base distribution with potential minor tweaks if we wanted.
         distribution = self._get_random_query_distribution()
-        persona = random.choice(self.PERSONAS)
+
+        selected_cot = random.choice(self.COT_STRATEGIES)
 
         prompt = f"""
-        {persona}
+        Your persona: {selected_style['style_name']}
+        {selected_style['instruction']}
+
         Task: Create a diverse set of training queries based on the provided legal text.
 
-        Target Distribution (Approximate):
-        1. [COMPLEX] ({distribution['complex']}): Multi-step reasoning where {case_name} (ID: {case_id}) is the primary answer source. `search_query` must be populated.
-        2. [SIMPLE] ({distribution['simple']}): Specific fact retrieval from this case. `search_query` can be populated or empty.
-        3. [GENERAL] ({distribution['general']}): General legal concept questions (e.g., "what is personal injury law?") that DON'T need search. `search_query` must be empty.
-        4. [NEGATIVE] ({distribution['negative']}): Questions that are barely related or out-of-scope. `search_query` must be empty.
+        Reasoning Strategy: {selected_cot['prompt']}
+
+        Target Distribution for this batch:
+        1. [COMPLEX] * {distribution['complex']}: Multi-step reasoning. Primary focus for '{selected_style['style_name']}' style.
+        2. [SIMPLE] * {distribution['simple']}: Specific fact retrieval.
+        3. [GENERAL] * {distribution['general']}: General legal concepts.
+        4. [NEGATIVE] * {distribution['negative']}: Out-of-scope.
 
         Output Structure (JSON ONLY):
         {{
             "queries": [
-                {{ "type": "complex", "question": "...", "search_query": "..." }},
-                {{ "type": "general", "question": "...", "search_query": null }},
+                {{
+                    "type": "complex",
+                    "thought": "Step-by-step reasoning using {selected_cot['name']} strategy on what to ask...",
+                    "question": "...",
+                    "search_query": "..."
+                }},
+                {{
+                    "type": "general",
+                    "thought": "Reasoning...",
+                    "question": "...",
+                    "search_query": null,
+                    "answer": "Final answer for general/simple questions that don't need search."
+                }},
                 ...
             ]
         }}
@@ -224,46 +266,97 @@ class BaseGenerator:
         Case Text (Truncated):
         {context_text[:15000]}
         """
+        self._log_prompt(
+            f"Pass 1 (Query Generation - {selected_cot['name']})",
+            prompt,
+            "(N/A - Prompt Construction)",
+        )
         return [
             {"role": "system", "content": "Output valid JSON list only."},
             {"role": "user", "content": prompt},
-        ]
+        ], selected_cot["name"]
 
-    PERSONAS = [
-        "You are an expert legal data annotator focused on creating challenging, realistic bar-exam style questions.",
-        "You are a curious law student acting as a user who needs specific details from cases.",
-        "You are a legal researcher constructing a dataset for training a high-precision legal AI.",
-        "You are a skeptic trying to find edge cases where the model might hallucinate or fail.",
+    QUERY_STYLES = [
+        {
+            "style_name": "The Senior Partner (Concise/Demanding)",
+            "instruction": "Generate questions that are brief, direct, and demand high-level analysis. The user sounds impatient. The search query must be highly technical using boolean operators if possible.",
+            "complexity_bias": "complex",
+        },
+        {
+            "style_name": "The Pro Se Litigant (Verbose/Confused)",
+            "instruction": "Generate questions that are overly wordy, emotional, and mix irrelevant details with the legal issue. The search query needs to extract the core legal keywords from the noise.",
+            "complexity_bias": "simple",
+        },
+        {
+            "style_name": "The Law Clerk (Procedural/Specific)",
+            "instruction": "Focus questions on procedural history, jurisdiction, and specific motions. The user is detail-oriented. The search query should target specific procedural keywords.",
+            "complexity_bias": "complex",
+        },
+        {
+            "style_name": "The Layman (Generalist)",
+            "instruction": "Generate questions using plain English, avoiding legal jargon. The user asks 'Can I sue?' rather than 'Is there a cause of action?'. The search query must bridge the gap between lay terms and legal terms.",
+            "complexity_bias": "general",
+        },
     ]
 
-    INSTRUCTIONS_TEMPLATES = [
+    OUTPUT_FORMATS = [
+        "Plain Text Paragraphs (Standard)",
+        "Bulleted List (Quick Summary)",
+        "Formal Legal Memo (Header: To, From, Re, Date)",
+        "Client Email (Professional but accessible)",
+        "Judicial Opinion Style (Formal, authoritative)",
+    ]
+
+    CONSTRAINTS = [
+        "Be extremely verbose. Explain every legal term used.",
+        "Be ruthless with conciseness. Use fewer than 100 words for the final answer.",
+        "Constraint: Cite the specific page number or paragraph if available in the text.",
+        "Constraint: Explain it as if the user is a 1st-year law student (didactic tone).",
+        "Constraint: Structure the answer with 'Key Holding', 'Reasoning', and 'Dicta' sections.",
+    ]
+
+    COT_STRATEGIES = [
+        {
+            "name": "Sequential_Logic",
+            "prompt": "Strategy: Sequential Analysis. In the 'thought' field, map the logic linearly: 'First, I will identify the jurisdiction. Second, I will check the standing. Third, I will apply the rule to the facts.' Do not skip steps.",
+        },
+        {
+            "name": "Adversarial_Critical",
+            "prompt": "Strategy: The Devil's Advocate. In the 'thought' field, assume the initial intuition is wrong. Look for contradictions, overruled precedents, or distinguishing facts in the search results. Use phrases like 'However, looking closer at...' or 'A potential counter-argument is...'",
+        },
+        {
+            "name": "Persona_Academic",
+            "prompt": "Strategy: The Legal Scholar. In the 'thought' field, focus on the 'why' and the policy behind the rule. Connect the specific facts to broader legal principles. Discuss the intent of the court.",
+        },
+        {
+            "name": "Persona_Data_Analyst",
+            "prompt": "Strategy: Evidence Extraction. In the 'thought' field, treat the text as a dataset. extract dates, names, amounts, and citations explicitly before synthesizing the answer. If data is missing, flag it immediately.",
+        },
         {
             "name": "IRAC_Strict",
-            "prompt": "Use the traditional IRAC (Issue, Rule, Application, Conclusion) format for the 'thought' field. Be very structured.",
-        },
-        {
-            "name": "Free_CoT",
-            "prompt": "Think through the problem step-by-step in the 'thought' field. Explore multiple interpretations before settling on an answer. Do not use a fixed header structure.",
-        },
-        {
-            "name": "Socratic_Review",
-            "prompt": "In your 'thought' process, first ask yourself what information is missing, then evaluate the provided text, and finally construct the answer. Be self-critical.",
-        },
-        {
-            "name": "Debate",
-            "prompt": "Draft arguments for and against the conclusion in the 'thought' field. Weigh the evidence from the text before providing the final answer.",
+            "prompt": "Strategy: IRAC Format. In the 'thought' field, explicitly label sections: [ISSUE], [RULE], [ANALYSIS], [CONCLUSION]. Ensure the analysis section connects specific facts to the rule.",
         },
     ]
 
     def _get_random_query_distribution(self):
-        # Randomize the mix to avoid fixed patterns
+        # Randomize the mix to avoid fixed patterns, but ensure negative_q is always 1
         total = 10
+        negative_q = 1
+
+        # Distributed remaining 9 among complex, simple, general
+        remaining = total - negative_q
+
         complex_q = random.randint(3, 6)
-        remaining = total - complex_q
-        simple_q = random.randint(1, remaining - 1) if remaining > 1 else 1
-        remaining = remaining - simple_q
-        general_q = random.randint(0, remaining)
-        negative_q = remaining - general_q
+        remaining -= complex_q
+
+        # Ensure at least 1 simple, and try to leave room for general
+        if remaining > 1:
+            simple_q = random.randint(1, remaining - 1)
+        else:
+            simple_q = remaining
+
+        general_q = remaining - simple_q
+
         return {
             "complex": complex_q,
             "simple": simple_q,
@@ -271,51 +364,89 @@ class BaseGenerator:
             "negative": negative_q,
         }
 
-    def _construct_answer_prompt(self, items: List[Dict], gold_text: str) -> List[Dict]:
-        task_prompt = (
-            "You are a legal AI assistant training to be strict and precise.\nTasks:\n"
-        )
-        for i, item in enumerate(items):
-            q_text = item["q_item"]["question"]
-            results = item["retrieved_context_str"]
-            has_search = bool(item["search_query"])
-
-            task_prompt += f"--- ITEM {i} ---\nQuestion: {q_text}\n"
-            if item["q_item"].get("type") == "general":
-                task_prompt += "Context (General Knowledge): You may use your internal knowledge for this general question.\n"
-            elif has_search:
-                task_prompt += f"Context (Search Results ONLY):\n{results if results else 'No results found.'}\n"
-            else:
-                task_prompt += f"Context (Gold Case):\n{gold_text[:10000]}\n"
-            task_prompt += "\n"
-
-        instruction_style = random.choice(self.INSTRUCTIONS_TEMPLATES)
-
-        task_prompt += f"""
-        IMPORTANT INSTRUCTIONS:
-        1. **Strict RAG**: If "Search Results ONLY" are provided, use ONLY that info. If not found, tell the user you couldn't find it.
-        2. **CoT Style**: {instruction_style['prompt']}
-        3. **Thought Content**: The 'thought' field must contain your raw internal reasoning trace. You can use <thought> tags internally if helpful, but the entire field will be wrapped in tags later.
-        4. **Citations**: Cite as [Case Name](ID: <case_id>).
-        5. **Complete Output**: Ensure the "answers" list contains exactly {len(items)} items.
-
-        Output valid JSON:
-        {{
-            "answers": [
-                {{ "item_id": 0, "thought": "...", "answer": "..." }},
-                {{ "item_id": 1, "thought": "...", "answer": "..." }},
-                ...
-                {{ "item_id": {len(items)-1}, "thought": "...", "answer": "..." }}
-            ]
-        }}
+    def construct_answer_conversations(
+        self, items: List[Dict], gold_text: str
+    ) -> List[List[Dict]]:
         """
-        return [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Output valid JSON object with an 'answers' key.",
-            },
-            {"role": "user", "content": task_prompt},
-        ]
+        Generates a list of conversation histories (message lists), one for each item.
+        Each conversation includes the Pass 1 thought and setup for the model to continue reasoning.
+        """
+        conversations = []
+
+        for i, item in enumerate(items):
+            q_item = item["q_item"]
+            if q_item.get("answer") and not q_item.get("search_query"):
+                # Already answered in Pass 1
+                continue
+
+            q_text = q_item["question"]
+            results = item.get("retrieved_context_str", "")
+            pass1_thought = q_item.get("thought", "Thinking...")
+
+            # Retrieve the Strategy used in Pass 1 (injected into q_item during processing)
+            strategy_name = q_item.get("cot_strategy_name", "Sequential_Logic")
+            # Find the prompt text
+            cot_prompt = next(
+                (
+                    s["prompt"]
+                    for s in self.COT_STRATEGIES
+                    if s["name"] == strategy_name
+                ),
+                "Think step by step.",
+            )
+
+            fmt = random.choice(self.OUTPUT_FORMATS)
+            constraint = random.choice(self.CONSTRAINTS)
+
+            system_msg = f"""You are a legal AI assistant.
+
+            INSTRUCTIONS:
+            1. **Reasoning Strategy**: Continue the reasoning process using this strategy: {cot_prompt}
+            2. **Output Format**: {fmt}
+            3. **Constraint/Tone**: {constraint}
+            4. **Strict RAG**: Use the provided Search Results. If answer not found, state explicitly. Do not use outside knowledge unless it's a general question.
+            5. **Citations**: only cite the case provided in the context [Case Name](ID: <case_id>).
+
+            Output valid JSON: {{ "thought": "...", "answer": "..." }}
+            """
+
+            # Construct Conversation History
+            # User: Question
+            # Assistant: <thought>Pass 1 thought...</thought> <search>query</search>
+            # User (Tool): Results
+
+            # Note: We want to "force" the model to see its previous thought.
+            # We can format this as a chat history.
+
+            msgs = [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": q_text},
+            ]
+
+            assistant_content = f"<thought>{pass1_thought}</thought>"
+            if q_item.get("search_query"):
+                assistant_content += f"\n<search>{q_item['search_query']}</search>"
+
+            msgs.append({"role": "assistant", "content": assistant_content})
+
+            # The "Tool Output" or "Search Results" coming from the user side (or tool role)
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": f"Search Results:\n{results if results else 'No results found.'}\n\nPlease provide the final answer based on the above.",
+                }
+            )
+
+            conversations.append(msgs)
+
+            # Log for debug
+            self._log_prompt(
+                f"Pass 2 (Item {i} - {strategy_name})",
+                json.dumps(msgs, indent=2),
+                "(N/A - Prompt Construction)",
+            )
+
+        return conversations
 
     def _parse_json_robust(self, text):
         try:
@@ -336,6 +467,9 @@ class BaseGenerator:
         return None
 
     def _parse_queries_output(self, content: str) -> List[Dict]:
+        self._log_prompt(
+            "Pass 1 (Query Generation) Response", "(N/A - Response Parsing)", content
+        )
         data = self._parse_json_robust(content)
         if isinstance(data, dict):
             if "queries" in data:
@@ -346,6 +480,9 @@ class BaseGenerator:
         return data if isinstance(data, list) else []
 
     def _parse_answers_output(self, content: str) -> List[Dict]:
+        self._log_prompt(
+            "Pass 2 (Answer Generation) Response", "(N/A - Response Parsing)", content
+        )
         data = self._parse_json_robust(content)
         if isinstance(data, dict):
             if "answers" in data:
