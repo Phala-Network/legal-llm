@@ -4,21 +4,11 @@ import argparse
 from typing import Dict, List, Set
 from collections import Counter, defaultdict
 import tqdm
+import sys
+# Add project root to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.utils.path_utils import normalize_case_path
 
-def normalize_case_path(path: str) -> str:
-    """
-    Normalizes a path like '/us/213/0301-01' or 'us/1/json/0001-01.json'
-    to 'us/1/0001-01'
-    """
-    path = path.lstrip("/")
-    if path.endswith(".json"):
-        path = path[:-5]
-
-    parts = path.split("/")
-    # Filter out 'json' directory from parts
-    parts = [p for p in parts if p != "json"]
-
-    return "/".join(parts)
 
 def get_case_id_from_file(rel_path: str, base_dir: str) -> str:
     return normalize_case_path(rel_path)

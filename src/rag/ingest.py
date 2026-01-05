@@ -17,10 +17,12 @@ import sys
 # Add project root to path to ensure imports work if run directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.rag.case_parser import CaseParser
+from src.rag.shard_manager import ShardManager
+from src.utils.path_utils import normalize_case_path
 
 
 class CaseIngester:
-    def __init__(self, data_dir="data", db_path="chroma_db"):
+    def __init__(self, data_dir="data", db_path="chroma_db", shard_assignments="shard_assignments.json"):
         self.data_dir = data_dir
         self.chroma_client = chromadb.PersistentClient(path=db_path)
         self.client = OpenAI()
@@ -34,28 +36,29 @@ class CaseIngester:
         # Initialize Parser
         self.parser = CaseParser(data_dir=data_dir)
 
-    def get_collection(self, state_name):
-        """
-        Get or create a collection for a specific state.
-        Normalizes state name to safe collection name string.
-        """
-        # Normalize: California -> law_cases_california
-        # "New York" -> law_cases_new_york
-        safe_name = re.sub(r"[^a-zA-Z0-9]", "_", state_name.lower())
-        col_name = f"law_cases_{safe_name}"
+        # Initialize ShardManager
+        self.shard_manager = ShardManager(assignments_path=shard_assignments)
+        if not self.shard_manager.load_assignments():
+            print(f"Warning: {shard_assignments} not found. Ingestion will use default 'global' shard.")
+            self.sharding_enabled = False
+        else:
+            self.sharding_enabled = True
 
+    def get_collection(self, collection_name):
+        """
+        Get or create a specific collection.
+        """
         with self.collection_lock:
-            if col_name in self.collections:
-                return self.collections[col_name]
+            if collection_name in self.collections:
+                return self.collections[collection_name]
 
             try:
-                col = self.chroma_client.get_collection(name=col_name)
-                # print(f"Loaded existing collection: {col_name}")
+                col = self.chroma_client.get_collection(name=collection_name)
             except:
-                col = self.chroma_client.create_collection(name=col_name)
-                print(f"Created new collection: {col_name}")
+                col = self.chroma_client.create_collection(name=collection_name)
+                print(f"Created new collection: {collection_name}")
 
-            self.collections[col_name] = col
+            self.collections[collection_name] = col
             return col
 
     def load_case_json(self, file_path):
@@ -120,11 +123,14 @@ class CaseIngester:
 
         return chunks
 
-    def ingest(self):
-        print(f"Scanning {self.data_dir}...")
+    def ingest(self, search_dir: str = None):
+        scan_dir = search_dir or self.data_dir
+        print(f"Scanning {scan_dir} ...")
         json_files = glob.glob(
-            os.path.join(self.data_dir, "**", "json", "*.json"), recursive=True
+            os.path.join(scan_dir, "**", "json", "*.json"), recursive=True
         )
+        # Filter metadata
+        json_files = [f for f in json_files if "Metadata" not in f]
         print(f"Found {len(json_files)} case files.")
 
         batches = {}  # "collection_name" -> {ids: [], docs: [], metas: []}
@@ -133,56 +139,59 @@ class CaseIngester:
 
         for json_file in tqdm(json_files):
             try:
-                case_data = self.load_case_json(json_file)
+                # 1. Determine case ID and assigned shards
+                rel_path = os.path.relpath(json_file, self.data_dir)
+                case_id_for_shard = normalize_case_path(rel_path)
 
-                # Metadata extraction
-                jurisdiction = case_data.get("jurisdiction", {}).get(
-                    "name_long", "Unknown"
-                )
-                case_id = str(case_data["id"])
-                name = case_data.get(
-                    "name_abbreviation", case_data.get("name", "Unknown")
-                )
+                target_shards = []
+                if self.sharding_enabled:
+                    shards = self.shard_manager.get_shards_for_case(case_id_for_shard)
+                    target_shards = [f"shard_{s:03d}" for s in shards]
+
+                if not target_shards:
+                    target_shards = ["global_collection"]
+
+                # 2. Extract and parse case data
+                case_data = self.load_case_json(json_file)
+                jurisdiction = case_data.get("jurisdiction", {}).get("name_long", "Unknown")
+                case_id_internal = str(case_data["id"])
+                name = case_data.get("name_abbreviation", case_data.get("name", "Unknown"))
                 date = case_data.get("decision_date", "Unknown")
                 citation = str(case_data.get("citations", [{}])[0].get("cite", ""))
 
-                # USE NEW PARSER
                 parsed_structure = self.parser.parse_case_structure(case_data)
-
-                # Chunking
                 chunks = self.chunk_text(parsed_structure, name, date)
 
-                # Get relevant collection object
-                safe_state_name = re.sub(r"[^a-zA-Z0-9]", "_", jurisdiction.lower())
-                col_key = f"law_cases_{safe_state_name}"
+                # 3. Add to batches for each assigned shard
+                for col_key in target_shards:
+                    self.get_collection(col_key) # Ensure exists
 
-                self.get_collection(jurisdiction)
-
-                if col_key not in batches:
-                    batches[col_key] = {"ids": [], "docs": [], "metas": []}
-
-                for i, chunk in enumerate(chunks):
-                    doc_id = f"{case_id}_{i}"
-
-                    batches[col_key]["ids"].append(doc_id)
-                    batches[col_key]["docs"].append(chunk)
-                    batches[col_key]["metas"].append(
-                        {
-                            "case_id": case_id,
-                            "name": name,
-                            "state": jurisdiction,
-                            "citation": citation,
-                            "file_path": json_file,
-                            "chunk_index": i,
-                        }
-                    )
-
-                    if len(batches[col_key]["ids"]) >= batch_size:
-                        batch_copy = batches[col_key]
+                    if col_key not in batches:
                         batches[col_key] = {"ids": [], "docs": [], "metas": []}
-                        futures.append(
-                            self.executor.submit(self._flush_batch, col_key, batch_copy)
+
+                    for i, chunk in enumerate(chunks):
+                        doc_id = f"{case_id_internal}_{i}"
+
+                        batches[col_key]["ids"].append(doc_id)
+                        batches[col_key]["docs"].append(chunk)
+                        batches[col_key]["metas"].append(
+                            {
+                                "case_id": case_id_internal,
+                                "path_id": case_id_for_shard,
+                                "name": name,
+                                "state": jurisdiction,
+                                "citation": citation,
+                                "file_path": json_file,
+                                "chunk_index": i,
+                            }
                         )
+
+                        if len(batches[col_key]["ids"]) >= batch_size:
+                            batch_copy = batches[col_key]
+                            batches[col_key] = {"ids": [], "docs": [], "metas": []}
+                            futures.append(
+                                self.executor.submit(self._flush_batch, col_key, batch_copy)
+                            )
 
             except Exception as e:
                 print(f"Skipping {json_file}: {e}")
@@ -218,5 +227,18 @@ class CaseIngester:
 
 
 if __name__ == "__main__":
-    ingester = CaseIngester()
-    ingester.ingest()
+    import argparse
+    parser = argparse.ArgumentParser(description="Ingest legal cases into sharded ChromaDB.")
+    parser.add_argument("--data_dir", type=str, default="data", help="Base data directory for ID normalization.")
+    parser.add_argument("--search_dir", type=str, default=None, help="Specific subdirectory to scan (for testing).")
+    parser.add_argument("--db_path", type=str, default="chroma_db", help="Path to ChromaDB storage.")
+    parser.add_argument("--assignments", type=str, default="data/shard_assignments.json", help="Path to shard assignments JSON.")
+
+    args = parser.parse_args()
+
+    ingester = CaseIngester(
+        data_dir=args.data_dir,
+        db_path=args.db_path,
+        shard_assignments=args.assignments
+    )
+    ingester.ingest(search_dir=args.search_dir)

@@ -4,6 +4,10 @@ import argparse
 from typing import Dict, List, Set
 from collections import Counter
 import tqdm
+import sys
+# Add project root to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.utils.path_utils import normalize_case_path
 
 class UnionFind:
     def __init__(self, elements: List[str]):
@@ -16,11 +20,11 @@ class UnionFind:
             # Handle cases that are cited but don't exist in our files
             # For this experiment, we only care about connections between existing cases
             return None
-        
+
         root = i
         while self.parent[root] != root:
             root = self.parent[root]
-        
+
         # Path compression
         while self.parent[i] != root:
             next_node = self.parent[i]
@@ -31,30 +35,16 @@ class UnionFind:
     def union(self, i: str, j: str):
         root_i = self.find(i)
         root_j = self.find(j)
-        
+
         if root_i and root_j and root_i != root_j:
             # Union by size
             if self.size[root_i] < self.size[root_j]:
                 root_i, root_j = root_j, root_i
-            
+
             self.parent[root_j] = root_i
             self.size[root_i] += self.size[root_j]
             self.num_sets -= 1
 
-def normalize_case_path(path: str) -> str:
-    """
-    Normalizes a path like '/us/213/0301-01' or 'us/1/json/0001-01.json'
-    to 'us/1/0001-01'
-    """
-    path = path.lstrip("/")
-    if path.endswith(".json"):
-        path = path[:-5]
-    
-    parts = path.split("/")
-    # Filter out 'json' directory from parts
-    parts = [p for p in parts if p != "json"]
-    
-    return "/".join(parts)
 
 def get_case_id_from_file(rel_path: str) -> str:
     # Example: us/1/json/0001-01.json -> us/1/0001-01
@@ -65,7 +55,7 @@ def analyze_groups(base_dir: str, search_dir: str, output_file: str = None):
     print(f"Search directory (for files): {search_dir}")
     case_files = []
     case_ids = set()
-    
+
     # 1. Collect all case files and IDs
     for root, dirs, files in os.walk(search_dir):
         for file in files:
@@ -75,18 +65,18 @@ def analyze_groups(base_dir: str, search_dir: str, output_file: str = None):
                 case_id = get_case_id_from_file(rel_path)
                 case_files.append((case_id, os.path.join(root, file)))
                 case_ids.add(case_id)
-    
+
     print(f"Found {len(case_ids)} unique cases to process.")
-    
+
     uf = UnionFind(list(case_ids))
-    
+
     # 2. Process citations
     print("Processing citations...")
     for case_id, file_path in tqdm.tqdm(case_files):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
+
             cites_to = data.get("cites_to", [])
             for cite in cites_to:
                 paths = cite.get("case_paths", [])
@@ -102,7 +92,7 @@ def analyze_groups(base_dir: str, search_dir: str, output_file: str = None):
     print("\nResult Statistics:")
     print(f"Total Cases: {len(case_ids)}")
     print(f"Total Groups (Disjoint Sets): {uf.num_sets}")
-    
+
     # Group size distribution
     roots = {}
     groups = {} # Map root -> list of member IDs
@@ -113,13 +103,13 @@ def analyze_groups(base_dir: str, search_dir: str, output_file: str = None):
             groups[root] = []
         roots[root] += 1
         groups[root].append(case_id)
-    
+
     group_sizes = list(roots.values())
     size_counts = Counter(group_sizes)
-    
+
     max_size = max(group_sizes) if group_sizes else 0
     print(f"Largest Group Size: {max_size}")
-    
+
     # Show top 10 groups
     print("\nTop 10 Largest Groups:")
     sorted_groups = sorted(roots.items(), key=lambda x: x[1], reverse=True)
@@ -135,7 +125,7 @@ def analyze_groups(base_dir: str, search_dir: str, output_file: str = None):
         (1001, 10000),
         (10001, float('inf'))
     ]
-    
+
     for start, end in ranges:
         count = sum(c for s, c in size_counts.items() if start <= s <= end)
         label = f"{start}-{end}" if end != float('inf') else f"{start}+"
@@ -158,5 +148,5 @@ if __name__ == "__main__":
     parser.add_argument("--search_dir", type=str, required=True, help="Directory to scan for case files (e.g., 'data/us')")
     parser.add_argument("--output", type=str, help="Path to save grouping results (JSON format)")
     args = parser.parse_args()
-    
+
     analyze_groups(args.base_dir, args.search_dir, args.output)

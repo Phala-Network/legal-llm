@@ -28,18 +28,28 @@ In this experiment, Case A and Case B were placed in the same group if _any_ cit
 
 ## Experiment 2: Local Neighborhoods (Ego-Networks)
 
-In this experiment, Case A's group includes itself and its **direct** neighbors (cases it cites + cases that cite it). Overlapping is expected.
+In this experiment, Case A's group includes itself and its **direct** neighbors (cases it cites + cases that cite it). Overlapping is expected. This strategy was initially verified on a US data sample and then scaled to the full dataset.
 
-- **Metric**: Size of Neighbor(X) for all X.
-- **Result**:
-  - **Max Neighborhood Size**: 923
-  - **Average Neighborhood Size**: 4.42
-- **Size Distribution (US Sample)**:
-  - **Size 1 (Isolated)**: 51.57%
-  - **Size 2-10**: 41.06%
-  - **Size 11-100**: 7.04%
-  - **Size 101-500**: 0.33%
-  - **Size 501+**: < 0.01%
+### Final Results (Full Dataset: 6,902,269 cases)
+
+| Metric                        | Value     |
+| :---------------------------- | :-------- |
+| **Total Cases**               | 6,902,269 |
+| **Max Neighborhood Size**     | 69,148    |
+| **Average Neighborhood Size** | 19.82     |
+
+#### Neighborhood Size Distribution
+
+| Size Range       | Count of Cases | Percentage |
+| :--------------- | :------------- | :--------- |
+| **1 (Isolated)** | 941,787        | 13.64%     |
+| **2 - 10**       | 2,664,757      | 38.61%     |
+| **11 - 50**      | 2,729,096      | 39.54%     |
+| **51 - 100**     | 405,761        | 5.88%      |
+| **101 - 500**    | 155,877        | 2.26%      |
+| **501+**         | 4,991          | 0.07%      |
+
+> [!NOTE] > **Observation**: Scaling to the full dataset drastically increased the connectivity. While the sample showed 51% isolated cases, the full dataset has only **13.6%** isolated cases, with nearly **80%** of cases belonging to neighborhoods of size 2-50.
 
 ---
 
@@ -51,5 +61,5 @@ In this experiment, Case A's group includes itself and its **direct** neighbors 
 
 ## Scripts & Tools
 
-- **Group Statistics**: [src/scripts/analyze_case_groups.py](file:///root/Documents/legal-llm/src/scripts/analyze_case_groups.py)
-- **Neighborhood Statistics**: [src/scripts/analyze_case_neighborhoods.py](file:///root/Documents/legal-llm/src/scripts/analyze_case_neighborhoods.py)
+- **Group Statistics**: [src/scripts/analyze_case_groups.py](../src/scripts/analyze_case_groups.py)
+- **Neighborhood Statistics**: [src/scripts/analyze_case_neighborhoods.py](../src/scripts/analyze_case_neighborhoods.py)

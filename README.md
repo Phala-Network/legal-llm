@@ -9,6 +9,7 @@ This project implements a high-performance legal AI assistant. It uses "Agentic 
 ### Key Features
 
 - **Agentic RAG**: Model autonomously decides when and what to search.
+- **Neighborhood-Based Sharding**: Effectively sharded vector DB supporting 6.9M+ cases by grouping them into citation neighborhoods (Ego-Networks).
 - **Efficient Fine-tuning**: Uses **Unsloth** for 4-bit LoRA training of Llama-3.3 and Qwen-2.5.
 - **High-Scale Data Gen**: Includes a multi-stage **OpenAI Batch API** pipeline for generating massive synthetic datasets at 50% lower cost.
 - **RAG Pipeline**: Semantic ingestion using **ChromaDB** and **OpenAI Embeddings**.
@@ -67,25 +68,54 @@ If you only need a specific reporter.
 uv run src/scripts/download_reporter.py --reporter cal-rptr-3d --max_volumes 5
 ```
 
-### 2. Ingest Data
+### 2. Sharding & Assignment Generation
 
-Place your case law JSONs in `data/` (or wherever you downloaded them) and run the ingester.
+For large datasets (6.9M+), generate citation-based shard assignments to optimize vector DB performance.
+
+**Analyze Neighborhoods**:
+
+```bash
+uv run src/scripts/analyze_case_neighborhoods.py --base_dir data --search_dir data --output data/case_neighborhoods.json
+```
+
+**Generate Shard Assignments**:
+
+```bash
+uv run src/rag/shard_manager.py --neighborhoods data/case_neighborhoods.json --shards 100 --output data/shard_assignments.json
+```
+
+### 3. Ingest Data
+
+Place your case law JSONs in `data/` and run the sharded ingester. This will use [data/shard_assignments.json](data/shard_assignments.json) to distribute cases into optimized collections.
 
 ```bash
 uv run src/rag/ingest.py
 ```
 
-### 3. Utility Scripts
-
-#### Normalize Citations
-
-If your training data contains file paths instead of IDs, use this to migrate them to unique case IDs.
+**Tip: Testing on a subset**:
+To verify the pipeline before a full run, use `--search_dir` to only ingest a specific reporter or volume:
 
 ```bash
-uv run src/scripts/migrate_data_to_id.py --input training_data.jsonl --output training_data_migrated.jsonl
+uv run src/rag/ingest.py --search_dir data/us/1
 ```
 
-### 4. Generate Synthetic Data
+### 4. Test Retrieval
+
+Use the retriever CLI to test queries. You can perform a global search or a "shard-focused" search by specifying a case ID to define the citation neighborhood.
+
+**Global Search**:
+
+```bash
+uv run src/rag/retriever.py "your legal question here"
+```
+
+**Focused Search (Neighborhood Aware)**:
+
+```bash
+uv run src/rag/retriever.py "your legal question" --focus "us/1/0001-01"
+```
+
+### 5. Generate Synthetic Data
 
 Choose between direct generation or the batch pipeline (recommended for large scale).
 
@@ -101,7 +131,7 @@ uv run src/data_gen/generate.py --num_samples 50
 uv run src/data_gen/generate_batch.py --pipeline --num_samples 1000
 ```
 
-### 5. Fine-tune Model
+### 6. Fine-tune Model
 
 Train the model using the generated `training_data.jsonl`.
 
@@ -109,7 +139,7 @@ Train the model using the generated `training_data.jsonl`.
 uv run src/finetune/train.py
 ```
 
-### 6. Run Inference
+### 7. Run Inference
 
 **Option A: Interactive CLI**
 
@@ -127,8 +157,31 @@ uv run src/inference/server.py
 - **Endpoint**: `POST /v1/chat/completions`
 - **Case Viewer**: `GET /cases/{case_id}` (renders case text as HTML)
 
+## Performance & Sharded Architecture
+
+To handle 6.9M cases efficiently, the system uses a **Shard-Aware Retrieval** architecture. Instead of a single giant index, cases are distributed into **overlapping citation neighborhoods**.
+
+### Dataset Connectivity (6.9M Cases)
+
+Analysis of the full dataset reveals highly dense citation inter-connectivity:
+
+| Metric                        | Value     |
+| :---------------------------- | :-------- |
+| **Total Cases**               | 6,902,269 |
+| **Max Neighborhood Size**     | 69,148    |
+| **Average Neighborhood Size** | 19.82     |
+
+**Neighborhood Size Distribution**:
+
+- **Size 1 (Isolated)**: 13.6%
+- **Size 2-50**: 78.1%
+- **Size 51-500**: 8.1%
+- **Size 501+**: 0.07%
+
+For more details on the sharding strategy, see [docs/case_grouping_report.md](docs/case_grouping_report.md).
+
 ## Details
 
 - **Base Model**: `unsloth/Qwen2.5-72B-Instruct-bnb-4bit`
-- **Vector DB**: ChromaDB (persisted in `chroma_db/`)
+- **Vector DB**: ChromaDB (Sharded, 100+ Collections)
 - **Embeddings**: `openai/text-embedding-3-large`
