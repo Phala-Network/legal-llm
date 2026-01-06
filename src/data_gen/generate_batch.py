@@ -100,18 +100,19 @@ class DataGenerator(BaseGenerator):
             for f_path in valid_files:
                 case_info = self._get_case_text(f_path)
                 cid = f"req-{uuid.uuid4()}"
+                messages, strategy = self._construct_query_prompt(case_info)
                 body = {
                     "custom_id": cid,
                     "method": "POST",
                     "url": "/v1/chat/completions",
                     "body": {
                         "model": self.model,
-                        "messages": self._construct_query_prompt(case_info),
+                        "messages": messages,
                         "response_format": {"type": "json_object"},
                     },
                 }
                 f.write(json.dumps(body) + "\n")
-                meta[cid] = os.path.abspath(f_path)
+                meta[cid] = {"path": os.path.abspath(f_path), "strategy": strategy}
         with open(map_file, "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -130,26 +131,48 @@ class DataGenerator(BaseGenerator):
                     continue
 
                 content = res["response"]["body"]["choices"][0]["message"]["content"]
-                case_info = self._get_case_text(q_map[cid])
-                queries = self._parse_queries_output(content)
 
+                # Meta is now a dict {path: ..., strategy: ...}
+                case_info = self._get_case_text(q_map[cid]["path"])
+                strategy = q_map[cid]["strategy"]
+
+                queries = self._parse_queries_output(content)
                 items = self.augment_queries_with_context(queries)
 
-                ans_cid = f"ans-{uuid.uuid4()}"
-                body = {
-                    "custom_id": ans_cid,
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": self.model,
-                        "messages": self._construct_answer_prompt(
-                            items, case_info["text"]
-                        ),
-                        "response_format": {"type": "json_object"},
-                    },
-                }
-                f_out.write(json.dumps(body) + "\n")
-                meta2[ans_cid] = {"original_file": q_map[cid], "items": items}
+                # Prepare Stage 2 requests (Fan-Out)
+                # Call construct_answer_conversations which returns List[List[Dict]] (list of conversations)
+
+                # First, ensure we inject the strategy name into items so construct_answer_conversations can see it
+                for item in items:
+                    item["q_item"]["cot_strategy_name"] = strategy
+
+                conversations = self.construct_answer_conversations(
+                    items, case_info["text"]
+                )
+
+                for i, messages in enumerate(conversations):
+                    if not messages:
+                        continue
+
+                    ans_cid = f"ans-{uuid.uuid4()}"
+                    body = {
+                        "custom_id": ans_cid,
+                        "method": "POST",
+                        "url": "/v1/chat/completions",
+                        "body": {
+                            "model": self.model,
+                            "messages": messages,
+                            "response_format": {"type": "json_object"},
+                        },
+                    }
+                    f_out.write(json.dumps(body) + "\n")
+
+                    # We need to link this specific answer request back to the specific item
+                    # items[i] corresponds to conversations[i] because of order preservation
+                    meta2[ans_cid] = {
+                        "original_file": q_map[cid]["path"],
+                        "item": items[i],
+                    }
         with open(m2, "w") as f:
             json.dump(meta2, f, indent=2)
 
@@ -170,18 +193,23 @@ class DataGenerator(BaseGenerator):
 
                 meta = a_map[cid]
                 content = res["response"]["body"]["choices"][0]["message"]["content"]
-                answers = self._parse_answers_output(content)
 
-                for ans in answers:
-                    idx = ans.get("item_id")
-                    if idx is None or idx >= len(meta["items"]):
-                        continue
-                    item = meta["items"][idx]
+                # In the new architecture, each request corresponds to ONE item.
+                # The content is coverage JSON: {thought: ..., answer: ...}
 
-                    msgs = self.construct_final_messages(item, ans)
-                    f_out.write(json.dumps({"messages": msgs}) + "\n")
-                    count += 1
+                ans_data = self._parse_json_robust(content)
+                if not ans_data:
+                    continue
 
+                item = meta["item"]
+                msgs = self.construct_final_messages(item, ans_data)
+
+                f_out.write(json.dumps({"messages": msgs}) + "\n")
+                count += 1
+
+                # We don't want to log the same file too many times, but simpler to preserve existing behavior or optimize?
+                # The original code wrote to log for every ANSWER.
+                # We'll just write it. deduplication happens at load time.
                 f_log.write(os.path.abspath(meta["original_file"]) + "\n")
         print(f"Added {count} examples.")
 

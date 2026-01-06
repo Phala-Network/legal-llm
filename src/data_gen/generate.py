@@ -32,7 +32,7 @@ class DataGenerator(BaseGenerator):
                 break
 
             case_info = self._get_case_text(json_file)
-            prompt = self._construct_query_prompt(case_info)
+            prompt, strategy = self._construct_query_prompt(case_info)
 
             try:
                 response = self.client.chat.completions.create(
@@ -49,29 +49,44 @@ class DataGenerator(BaseGenerator):
 
                 items_to_process = self.augment_queries_with_context(queries)
 
-                ans_prompt = self._construct_answer_prompt(
+                # Inject strategy for Pass 2
+                for item in items_to_process:
+                    item["q_item"]["cot_strategy_name"] = strategy
+
+                conversations = self.construct_answer_conversations(
                     items_to_process, case_info["text"]
                 )
-                ans_res = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=ans_prompt,
-                    response_format={"type": "json_object"},
-                    temperature=0.3,
-                )
-                answers = self._parse_answers_output(ans_res.choices[0].message.content)
 
-                for ans_data in answers:
-                    idx = ans_data.get("item_id")
-                    if idx is None or idx >= len(items_to_process):
+                # Process each conversation individually (Pass 2)
+                for i, msgs in enumerate(conversations):
+                    if not msgs:
                         continue
-                    item = items_to_process[idx]
 
-                    messages = self.construct_final_messages(item, ans_data)
+                    try:
+                        ans_res = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=msgs,
+                            response_format={"type": "json_object"},
+                            temperature=0.3,
+                        )
+                        ans_content = ans_res.choices[0].message.content
+                        ans_data = self._parse_json_robust(ans_content)
 
-                    with open(self.output_file, "a", encoding="utf-8") as out_f:
-                        out_f.write(json.dumps({"messages": messages}) + "\n")
-                    valid_count += 1
-                    pbar.update(1)
+                        if not ans_data:
+                            continue
+
+                        # items_to_process[i] corresponds to conversations[i]
+                        item = items_to_process[i]
+                        final_messages = self.construct_final_messages(item, ans_data)
+
+                        with open(self.output_file, "a", encoding="utf-8") as out_f:
+                            out_f.write(json.dumps({"messages": final_messages}) + "\n")
+
+                        valid_count += 1
+                        pbar.update(1)
+
+                    except Exception as e:
+                        print(f"Error processing item {i} in {json_file}: {e}")
 
                 with open(self.processed_log, "a") as f:
                     f.write(os.path.abspath(json_file) + "\n")
