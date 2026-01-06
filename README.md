@@ -9,6 +9,7 @@ This project implements a high-performance legal AI assistant. It uses "Agentic 
 ### Key Features
 
 - **Agentic RAG**: Model autonomously decides when and what to search.
+- **Hybrid Retrieval**: Combines **Tantivy** (Full-Text Search) for global routing and **ChromaDB** (Vector Search) for deep context retrieval.
 - **Neighborhood-Based Sharding**: Effectively sharded vector DB supporting 6.9M+ cases by grouping them into citation neighborhoods (Ego-Networks).
 - **Efficient Fine-tuning**: Uses **Unsloth** for 4-bit LoRA training of Llama-3.3 and Qwen-2.5.
 - **High-Scale Data Gen**: Includes a multi-stage **OpenAI Batch API** pipeline for generating massive synthetic datasets at 50% lower cost.
@@ -68,52 +69,56 @@ If you only need a specific reporter.
 uv run src/scripts/download_reporter.py --reporter cal-rptr-3d --max_volumes 5
 ```
 
-### 2. Sharding & Assignment Generation
+### 2. Sharding & Neighborhood Analysis
 
-For large datasets (6.9M+), generate citation-based shard assignments to optimize vector DB performance.
-
-**Analyze Neighborhoods**:
+For large datasets (6.9M+), analyze citation neighborhoods to optimize vector DB performance.
 
 ```bash
 uv run src/scripts/analyze_case_neighborhoods.py --base_dir data --search_dir data --output data/case_neighborhoods.json
 ```
 
-**Generate Shard Assignments**:
+### 3. Unified Ingestion (Sharding -> Vector DB -> Router Index)
+
+Place your case law JSONs in `data/` and run the unified ingester. This script performs three critical steps:
+
+1. **Generates Shard Assignments** based on citation neighborhoods.
+2. **Ingests semi-structured case text** into sharded ChromaDB collections.
+3. **Builds a Global Router Index** (Tantivy) for full-text routing.
 
 ```bash
-uv run src/rag/shard_manager.py --neighborhoods data/case_neighborhoods.json --shards 100 --output data/shard_assignments.json
-```
-
-### 3. Ingest Data
-
-Place your case law JSONs in `data/` and run the sharded ingester. This will use [data/shard_assignments.json](data/shard_assignments.json) to distribute cases into optimized collections.
-
-```bash
-uv run src/rag/ingest.py
+uv run src/rag/ingest.py --neighborhoods data/case_neighborhoods.json
 ```
 
 **Tip: Testing on a subset**:
 To verify the pipeline before a full run, use `--search_dir` to only ingest a specific reporter or volume:
 
 ```bash
-uv run src/rag/ingest.py --search_dir data/us/1
+uv run src/rag/ingest.py --search_dir data/us/1 --neighborhoods data/case_neighborhoods.json
 ```
 
-### 4. Test Retrieval
+### 4. Integrated Retrieval (End-to-End)
 
-Use the retriever CLI to test queries. You can perform a global search or a "shard-focused" search by specifying a case ID to define the citation neighborhood.
+The `CaseRetriever` now handles the entire two-stage retrieval process internally, leveraging the global router index.
 
-**Global Search**:
+**End-to-End Search**:
 
 ```bash
-uv run src/rag/retriever.py "your legal question here"
+uv run src/rag/retriever.py "locomotive brakes livestock"
 ```
 
 **Focused Search (Neighborhood Aware)**:
+If you know the specific case context, you can focus the search on its citation neighborhood shard:
 
 ```bash
 uv run src/rag/retriever.py "your legal question" --focus "us/1/0001-01"
 ```
+
+**How it works**:
+
+1. **Global Router**: Queries the Tantivy index to find the best candidate "Anchor Case".
+2. **Shard Resolution**: Uses `ShardManager` to identify the shard containing that case's citation neighborhood.
+3. **Vector Retrieval**: Performs semantic search within the identified ChromaDB shard(s).
+4. **Reranking**: Scores and ranks the combined candidates using a Cross-Encoder.
 
 ### 5. Generate Synthetic Data
 
@@ -183,5 +188,6 @@ For more details on the sharding strategy, see [docs/case_grouping_report.md](do
 ## Details
 
 - **Base Model**: `unsloth/Qwen2.5-72B-Instruct-bnb-4bit`
+- **Global Index**: Tantivy (BM25, Tiered Routing)
 - **Vector DB**: ChromaDB (Sharded, 100+ Collections)
 - **Embeddings**: `openai/text-embedding-3-large`

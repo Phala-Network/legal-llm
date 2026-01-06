@@ -18,6 +18,10 @@ bm25_index.pkl
 data/*
 !data/.gitkeep
 processed_files.txt
+
+tantivy_index*/
+chroma_db*/
+
 /*.json
 /*.jsonl
 

@@ -7,9 +7,7 @@ import glob
 from tqdm import tqdm
 import re
 from dotenv import load_dotenv
-
-load_dotenv()
-
+import tantivy
 import concurrent.futures
 import threading
 import sys
@@ -20,9 +18,11 @@ from src.rag.case_parser import CaseParser
 from src.rag.shard_manager import ShardManager
 from src.utils.path_utils import normalize_case_path
 
+load_dotenv()
+
 
 class CaseIngester:
-    def __init__(self, data_dir="data", db_path="chroma_db", shard_assignments="shard_assignments.json"):
+    def __init__(self, data_dir="data", db_path="chroma_db", shard_assignments="data/shard_assignments.json", index_dir="tantivy_index"):
         self.data_dir = data_dir
         self.chroma_client = chromadb.PersistentClient(path=db_path)
         self.client = OpenAI()
@@ -38,11 +38,10 @@ class CaseIngester:
 
         # Initialize ShardManager
         self.shard_manager = ShardManager(assignments_path=shard_assignments)
-        if not self.shard_manager.load_assignments():
-            print(f"Warning: {shard_assignments} not found. Ingestion will use default 'global' shard.")
-            self.sharding_enabled = False
-        else:
-            self.sharding_enabled = True
+        self.shard_assignments_path = shard_assignments
+
+        # Tantivy Index Settings
+        self.index_dir = index_dir
 
     def get_collection(self, collection_name):
         """
@@ -123,8 +122,37 @@ class CaseIngester:
 
         return chunks
 
-    def ingest(self, search_dir: str = None):
+    def setup_tantivy(self):
+        if not os.path.exists(self.index_dir):
+            os.makedirs(self.index_dir)
+
+        # Define Schema
+        schema_builder = tantivy.SchemaBuilder()
+        schema_builder.add_text_field("title", stored=True)
+        schema_builder.add_text_field("body", stored=False)
+        schema_builder.add_unsigned_field("case_id", stored=True)
+        schema_builder.add_text_field("slug", stored=True) # Normalized path
+        schema = schema_builder.build()
+
+        # Create Index
+        index = tantivy.Index(schema, path=self.index_dir)
+        return index, index.writer()
+
+    def ingest(self, search_dir: str = None, neighborhoods_path: str = None):
         scan_dir = search_dir or self.data_dir
+
+        # 1. Shard Assignment Generation
+        # Only generate if they don't exist yet
+        already_loaded = self.shard_manager.load_assignments()
+
+        if neighborhoods_path and os.path.exists(neighborhoods_path) and not already_loaded:
+            print(f"Generating shard assignments from {neighborhoods_path}...")
+            self.shard_manager.generate_assignments(neighborhoods_path)
+
+        if not self.shard_manager.load_assignments():
+            print(f"Error: Shard assignments not found at {self.shard_assignments_path}. Please provide --neighborhoods if this is the first run.")
+            return
+
         print(f"Scanning {scan_dir} ...")
         json_files = glob.glob(
             os.path.join(scan_dir, "**", "json", "*.json"), recursive=True
@@ -133,37 +161,53 @@ class CaseIngester:
         json_files = [f for f in json_files if "Metadata" not in f]
         print(f"Found {len(json_files)} case files.")
 
+        # 2. Setup Tantivy
+        tantivy_index, tantivy_writer = self.setup_tantivy()
+
         batches = {}  # "collection_name" -> {ids: [], docs: [], metas: []}
         batch_size = 50
         futures = []
 
         for json_file in tqdm(json_files):
             try:
-                # 1. Determine case ID and assigned shards
+                # Determine case ID and assigned shards
                 rel_path = os.path.relpath(json_file, self.data_dir)
                 case_id_for_shard = normalize_case_path(rel_path)
 
-                target_shards = []
-                if self.sharding_enabled:
-                    shards = self.shard_manager.get_shards_for_case(case_id_for_shard)
-                    target_shards = [f"shard_{s:03d}" for s in shards]
-
+                target_shards = self.shard_manager.get_shards_for_case(case_id_for_shard)
                 if not target_shards:
-                    target_shards = ["global_collection"]
+                    print(f"Warning: No shards assigned for {case_id_for_shard}. Skipping.")
+                    continue
 
-                # 2. Extract and parse case data
+                target_collection_names = [f"shard_{s:03d}" for s in target_shards]
+
+                # Extract and parse case data
                 case_data = self.load_case_json(json_file)
                 jurisdiction = case_data.get("jurisdiction", {}).get("name_long", "Unknown")
-                case_id_internal = str(case_data["id"])
+                case_id_internal = int(case_data["id"])
                 name = case_data.get("name_abbreviation", case_data.get("name", "Unknown"))
                 date = case_data.get("decision_date", "Unknown")
                 citation = str(case_data.get("citations", [{}])[0].get("cite", ""))
 
                 parsed_structure = self.parser.parse_case_structure(case_data)
+
+                # Add to Tantivy Index
+                head_matter = parsed_structure.get("head_matter", "")
+                content_blocks = parsed_structure.get("content_blocks", [])
+                full_text_for_index = head_matter + "\n" + "\n".join(content_blocks)
+
+                tantivy_writer.add_document(tantivy.Document(
+                    title=name,
+                    body=full_text_for_index,
+                    case_id=case_id_internal,
+                    slug=case_id_for_shard
+                ))
+
+                # Chunk for Vector DB
                 chunks = self.chunk_text(parsed_structure, name, date)
 
-                # 3. Add to batches for each assigned shard
-                for col_key in target_shards:
+                # Add to batches for each assigned shard
+                for col_key in target_collection_names:
                     self.get_collection(col_key) # Ensure exists
 
                     if col_key not in batches:
@@ -176,7 +220,7 @@ class CaseIngester:
                         batches[col_key]["docs"].append(chunk)
                         batches[col_key]["metas"].append(
                             {
-                                "case_id": case_id_internal,
+                                "case_id": str(case_id_internal),
                                 "path_id": case_id_for_shard,
                                 "name": name,
                                 "state": jurisdiction,
@@ -195,6 +239,10 @@ class CaseIngester:
 
             except Exception as e:
                 print(f"Skipping {json_file}: {e}")
+
+        # Final commit and flush
+        print("Finishing Tantivy index and remaining vector batches...")
+        tantivy_writer.commit()
 
         for col_key, batch_data in batches.items():
             if batch_data["ids"]:
@@ -228,17 +276,20 @@ class CaseIngester:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Ingest legal cases into sharded ChromaDB.")
+    parser = argparse.ArgumentParser(description="Unified Ingestion: Shard assignments -> Vector Index -> Global Router Index.")
     parser.add_argument("--data_dir", type=str, default="data", help="Base data directory for ID normalization.")
     parser.add_argument("--search_dir", type=str, default=None, help="Specific subdirectory to scan (for testing).")
+    parser.add_argument("--neighborhoods", type=str, default=None, help="Path to case neighborhoods JSON to generate/update assignments.")
     parser.add_argument("--db_path", type=str, default="chroma_db", help="Path to ChromaDB storage.")
     parser.add_argument("--assignments", type=str, default="data/shard_assignments.json", help="Path to shard assignments JSON.")
+    parser.add_argument("--index_dir", type=str, default="tantivy_index", help="Path to Tantivy index directory.")
 
     args = parser.parse_args()
 
     ingester = CaseIngester(
         data_dir=args.data_dir,
         db_path=args.db_path,
-        shard_assignments=args.assignments
+        shard_assignments=args.assignments,
+        index_dir=args.index_dir
     )
-    ingester.ingest(search_dir=args.search_dir)
+    ingester.ingest(search_dir=args.search_dir, neighborhoods_path=args.neighborhoods)

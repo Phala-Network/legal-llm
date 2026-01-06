@@ -2,10 +2,8 @@ import chromadb
 from openai import OpenAI
 from sentence_transformers import CrossEncoder
 import numpy as np
-from rank_bm25 import BM25Okapi
-import pickle
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,12 +12,12 @@ import sys
 # Add project root to path to ensure imports work if run directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.rag.shard_manager import ShardManager
+from src.retrieval.router import ShardRouter
 from src.utils.path_utils import normalize_case_path
 
 class CaseRetriever:
-    def __init__(self, db_path="chroma_db", default_collection="global_collection", shard_assignments="data/shard_assignments.json"):
+    def __init__(self, db_path="chroma_db", index_dir="tantivy_index", shard_assignments="data/shard_assignments.json"):
         self.chroma_client = chromadb.PersistentClient(path=db_path)
-        self.default_collection_name = default_collection
         self.client = OpenAI()
         self.embedding_model_name = os.getenv(
             "EMBEDDING_MODEL_NAME", "openai/text-embedding-3-large"
@@ -27,9 +25,11 @@ class CaseRetriever:
 
         # Initialize ShardManager
         self.shard_manager = ShardManager(assignments_path=shard_assignments)
-        self.sharding_enabled = self.shard_manager.load_assignments()
-        if not self.sharding_enabled:
-            print(f"Warning: {shard_assignments} not found. Retrieval will use default collection.")
+        if not self.shard_manager.load_assignments():
+            raise ValueError(f"Shard assignments not found at {shard_assignments}. Run ingestion first.")
+
+        # Initialize Global Router (Tantivy)
+        self.router = ShardRouter(index_dir)
 
         # Cache for collections
         self.collections = {}
@@ -38,61 +38,16 @@ class CaseRetriever:
         print("Loading Reranker (this may take a moment first time)...")
         self.reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
 
-        # Sparse Index (BM25)
-        # Note: In a sharded system, BM25 should ideally be sharded too.
-        # For this version, we'll maintain the existing logic but aim for shard-specific BM25 in future.
-        self.bm25_path = "bm25_index.pkl"
-        self.bm25 = None
-        self.doc_ids = []
-        self.docs_text = []
-        # self._init_bm25() # Disabling auto-init for now as it needs collection context
-
     def get_collection(self, name):
         if name not in self.collections:
             try:
                 self.collections[name] = self.chroma_client.get_collection(name=name)
             except:
-                # If it doesn't exist, we might be searching an empty shard or global
-                if name == self.default_collection_name:
-                     self.collections[name] = self.chroma_client.create_collection(name=name)
-                else:
-                     return None
+                return None
         return self.collections[name]
 
-    def _init_bm25(self):
-        if os.path.exists(self.bm25_path):
-            print("Loading BM25 index...")
-            with open(self.bm25_path, "rb") as f:
-                data = pickle.load(f)
-                self.bm25 = data["model"]
-                self.doc_ids = data["ids"]
-                self.docs_text = data["texts"]
-        else:
-            print("Building BM25 index from Vector DB (One-time setup)...")
-            # Fetch all documents from Chroma
-            # WARNING: This scales poorly. limit to 10k for now or implement scrolling.
-            results = self.collection.get()
-            texts = results["documents"]
-            ids = results["ids"]
-
-            if not texts:
-                print("Vector DB empty. BM25 not initialized.")
-                return
-
-            tokenized_corpus = [
-                doc.split() for doc in texts
-            ]  # Simple whitespace tokenizer
-            self.bm25 = BM25Okapi(tokenized_corpus)
-            self.doc_ids = ids
-            self.docs_text = texts
-
-            # Save
-            with open(self.bm25_path, "wb") as f:
-                pickle.dump({"model": self.bm25, "ids": ids, "texts": texts}, f)
-            print("BM25 index built and saved.")
-
-    def search_vector(self, query, k=25, shard_name=None):
-        target_col = self.get_collection(shard_name or self.default_collection_name)
+    def search_vector(self, query: str, k: int = 25, shard_name: str = None) -> List[Dict[str, Any]]:
+        target_col = self.get_collection(shard_name)
         if not target_col:
             return []
 
@@ -103,106 +58,84 @@ class CaseRetriever:
             .data[0]
             .embedding
         )
-        img_results = target_col.query(query_embeddings=[embedding], n_results=k)
+        results = target_col.query(query_embeddings=[embedding], n_results=k)
 
-        # Format
         hits = []
-        if img_results["documents"]:
-            for i in range(len(img_results["documents"][0])):
+        if results["documents"]:
+            for i in range(len(results["documents"][0])):
                 hits.append(
                     {
-                        "id": img_results["ids"][0][i],
-                        "text": img_results["documents"][0][i],
-                        "metadata": img_results["metadatas"][0][i],
-                        "score": 0.0,  # Placeholder
+                        "id": results["ids"][0][i],
+                        "text": results["documents"][0][i],
+                        "metadata": results["metadatas"][0][i],
+                        "score": 0.0,
                     }
                 )
         return hits
 
-    def search_keyword(self, query, k=25):
-        if not self.bm25:
-            return []
-
-        tokenized_query = query.split()
-        scores = self.bm25.get_scores(tokenized_query)
-        top_n = np.argsort(scores)[::-1][:k]
-
-        hits = []
-        for idx in top_n:
-            hits.append(
-                {
-                    "id": self.doc_ids[idx],
-                    "text": self.docs_text[idx],
-                    "metadata": {},  # We'd need to store metadata in pickle too to be perfect, or fetch from Chroma
-                    "score": scores[idx],
-                }
-            )
-        return hits
-
-    def retrieve(self, query, k=5, focus_case_id=None):
+    def retrieve(self, query: str, k: int = 5, focus_case_id: str = None, router_top_k: int = 3) -> List[Dict[str, Any]]:
         """
-        Retrieves relevant cases. If focus_case_id is provided,
-        constrains search to the relevant citation neighborhood shard.
+        Retrieves relevant cases.
+        If focus_case_id is provided, constrains search to that case's primary shard.
+        Otherwise, uses the Global Router to find candidate shards.
         """
-        # Determine target shard
-        target_shard = None
-        if focus_case_id and self.sharding_enabled:
+        target_shards = set()
+
+        if focus_case_id:
             focus_case_id = normalize_case_path(focus_case_id)
             shard_id = self.shard_manager.get_primary_shard(focus_case_id)
             if shard_id is not None:
-                target_shard = f"shard_{shard_id:03d}"
-                print(f"Focusing search on shard: {target_shard} (Case: {focus_case_id})")
+                target_shards.add(f"shard_{shard_id:03d}")
+                print(f"Focusing search on shard: shard_{shard_id:03d} (Case: {focus_case_id})")
+        else:
+            # Stage 1: Global Routing
+            print(f"Routing query: '{query}'")
+            candidates = self.router.route(query, top_k=router_top_k)
+            for c in candidates:
+                slug = c["slug"]
+                shard_id = self.shard_manager.get_primary_shard(slug)
+                if shard_id is not None:
+                    target_shards.add(f"shard_{shard_id:03d}")
 
-        # 1. Hybrid Retrieval (Vector + Keyword)
-        vector_k = 30
-        keyword_k = 30
+            print(f"Routed to shards: {target_shards}")
 
-        vec_results = self.search_vector(query, k=vector_k, shard_name=target_shard)
-        # Note: BM25 keyword search is still simplified for now.
-        # Ideally would also be shard-constrained.
-        kw_results = self.search_keyword(query, k=keyword_k)
-
-        # Merge
-        combined = {r["id"]: r for r in vec_results}
-        for r in kw_results:
-            if r["id"] not in combined:
-                combined[r["id"]] = r
-
-        # Ensure metadata is populated
-        missing_metadata_ids = [rid for rid in combined if not combined[rid].get("metadata")]
-        if missing_metadata_ids:
-            col = self.get_collection(target_shard or self.default_collection_name)
-            if col:
-                try:
-                    metas = col.get(ids=missing_metadata_ids, include=["metadatas", "documents"])
-                    for i, mid in enumerate(metas["ids"]):
-                         if mid in combined:
-                             combined[mid]["metadata"] = metas["metadatas"][i]
-                             combined[mid]["text"] = metas["documents"][i]
-                except:
-                    pass
-
-        candidates = list(combined.values())
-        if not candidates:
+        if not target_shards:
+            print("No target shards identified.")
             return []
 
-        # 2. Re-ranking
-        pairs = [[query, doc["text"]] for doc in candidates]
+        # Stage 2: Vector Search in identified shards
+        all_candidates = []
+        seen_doc_ids = set()
+
+        for shard_name in target_shards:
+            shard_hits = self.search_vector(query, k=20, shard_name=shard_name)
+            for hit in shard_hits:
+                if hit["id"] not in seen_doc_ids:
+                    all_candidates.append(hit)
+                    seen_doc_ids.add(hit["id"])
+
+        if not all_candidates:
+            return []
+
+        # Stage 3: Re-ranking
+        print(f"Re-ranking {len(all_candidates)} candidates...")
+        pairs = [[query, doc["text"]] for doc in all_candidates]
         scores = self.reranker.predict(pairs)
 
-        for i, doc in enumerate(candidates):
+        for i, doc in enumerate(all_candidates):
             doc["rerank_score"] = float(scores[i])
 
-        ranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+        ranked = sorted(all_candidates, key=lambda x: x["rerank_score"], reverse=True)
         return ranked[:k]
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Test Shard-Aware Retrieval.")
+    parser = argparse.ArgumentParser(description="Integrated Shard-Aware Retrieval.")
     parser.add_argument("query", type=str, help="Search query")
     parser.add_argument("--focus", type=str, help="Case ID to focus search (Neighborhood search)")
     parser.add_argument("--db_path", type=str, default="chroma_db")
+    parser.add_argument("--index_dir", type=str, default="tantivy_index")
     parser.add_argument("--assignments", type=str, default="data/shard_assignments.json")
     parser.add_argument("--k", type=int, default=5)
 
@@ -210,6 +143,7 @@ if __name__ == "__main__":
 
     retriever = CaseRetriever(
         db_path=args.db_path,
+        index_dir=args.index_dir,
         shard_assignments=args.assignments
     )
 
