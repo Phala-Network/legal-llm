@@ -86,14 +86,14 @@ Place your case law JSONs in `data/` and run the unified ingester. This script p
 3. **Builds a Global Router Index** (Tantivy) for full-text routing.
 
 ```bash
-uv run src/rag/ingest.py --neighborhoods data/case_neighborhoods.json
+uv run src/rag/ingest.py --data_dir data --assignments data/shard_assignments.json --db_path chroma_db --index_dir tantivy_index --batch_dir .
 ```
 
 **Tip: Testing on a subset**:
 To verify the pipeline before a full run, use `--search_dir` to only ingest a specific reporter or volume:
 
 ```bash
-uv run src/rag/ingest.py --search_dir data/us/1 --neighborhoods data/case_neighborhoods.json
+uv run src/rag/ingest.py --data_dir data --search_dir data/us/1 --assignments data/shard_assignments.json --db_path test_run/chroma_db --index_dir test_run/tantivy_index --batch_dir test_run
 ```
 
 ### 4. Integrated Retrieval (End-to-End)
@@ -103,14 +103,14 @@ The `CaseRetriever` now handles the entire two-stage retrieval process internall
 **End-to-End Search**:
 
 ```bash
-uv run src/rag/retriever.py "locomotive brakes livestock"
+uv run src/rag/retriever.py --db_path chroma_db --index_dir tantivy_index "your search"
 ```
 
 **Focused Search (Neighborhood Aware)**:
 If you know the specific case context, you can focus the search on its citation neighborhood shard:
 
 ```bash
-uv run src/rag/retriever.py "your legal question" --focus "us/1/0001-01"
+uv run src/rag/retriever.py "your search" --focus "us/1/0001-01"
 ```
 
 **How it works**:
