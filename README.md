@@ -22,6 +22,7 @@ This project implements a high-performance legal AI assistant. It uses "Agentic 
 - `src/data_gen`: Synthetic data generation.
   - `generate.py`: Direct generation (low latency).
   - `generate_batch.py`: Automated multi-stage pipeline using OpenAI Batch API.
+  - `mix_external.py`: Utility to mix in external datasets (e.g., SlimOrca) for general instruction following.
 - `src/finetune`: Unsloth training scripts and data sampling utilities.
 - `src/inference`:
   - `server.py`: OpenAI-compatible FastAPI server.
@@ -84,9 +85,9 @@ uv run src/scripts/analyze_case_neighborhoods.py \
 
 Place your case law JSONs in `data/` and run the unified ingester. This script performs three critical steps:
 
-1. **Generates Shard Assignments** based on citation neighborhoods.
-2. **Ingests semi-structured case text** into sharded ChromaDB collections.
-3. **Builds a Global Router Index** (Tantivy) for full-text routing.
+1.  **Generates Shard Assignments** based on citation neighborhoods.
+2.  **Ingests semi-structured case text** into sharded ChromaDB collections.
+3.  **Builds a Global Router Index** (Tantivy) for full-text routing.
 
 ```bash
 # Ingest data into a standalone 'test_run/' directory
@@ -139,10 +140,10 @@ uv run src/rag/retriever.py \
 
 **How it works**:
 
-1. **Global Router**: Queries the Tantivy index to find the best candidate "Anchor Case".
-2. **Shard Resolution**: Uses `ShardManager` to identify the shard containing that case's citation neighborhood.
-3. **Vector Retrieval**: Performs semantic search within the identified ChromaDB shard(s).
-4. **Reranking**: Scores and ranks the combined candidates using a Cross-Encoder.
+1.  **Global Router**: Queries the Tantivy index to find the best candidate "Anchor Case".
+2.  **Shard Resolution**: Uses `ShardManager` to identify the shard containing that case's citation neighborhood.
+3.  **Vector Retrieval**: Performs semantic search within the identified ChromaDB shard(s).
+4.  **Reranking**: Scores and ranks the combined candidates using a Cross-Encoder.
 
 ### 5. Generate Synthetic Data
 
@@ -167,7 +168,20 @@ uv run src/data_gen/generate_batch.py \
     --shard_assignments test_run/shard_assignments.json
 ```
 
-### 6. Fine-tune Model
+### 6. Mix External Data (Augmentation)
+
+To enhance the model's general instruction-following capabilities, you can mix in external datasets like **SlimOrca**. This script pulls samples from Hugging Face and converts them to the local `messages` format.
+
+```bash
+uv run src/data_gen/mix_external.py \
+    --output_file test_run/generation/training_data.jsonl \
+    --num_samples 1000
+```
+
+> [!NOTE]
+> This script uses the `datasets` library, which is automatically installed as a dependency of `unsloth`.
+
+### 7. Fine-tune Model
 
 Train the model using the generated `training_data.jsonl`.
 
@@ -175,7 +189,7 @@ Train the model using the generated `training_data.jsonl`.
 uv run src/finetune/train.py --train_data test_run/generation/training_data.jsonl
 ```
 
-### 7. Run Inference
+### 8. Run Inference
 
 **Option A: Interactive CLI**
 
