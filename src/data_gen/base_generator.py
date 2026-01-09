@@ -24,11 +24,21 @@ class BaseGenerator:
         self,
         data_dir: str = "data",
         output_file: str = "training_data.jsonl",
+        output_dir: str = ".",
         model: Optional[str] = None,
+        **kwargs,
     ):
         self.data_dir = data_dir
-        self.output_file = output_file
-        self.processed_log = "processed_files.txt"
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # If output_file is just a name, put it in output_dir
+        if not os.path.dirname(output_file) and output_dir != ".":
+            self.output_file = os.path.join(self.output_dir, output_file)
+        else:
+            self.output_file = output_file
+
+        self.processed_log = os.path.join(self.output_dir, "processed_files.txt")
         self.processed_files = set()
         if os.path.exists(self.processed_log):
             with open(self.processed_log, "r") as f:
@@ -38,12 +48,13 @@ class BaseGenerator:
         self.model = model or os.getenv("GENERATION_MODEL", "gpt-4o")
         self.parser = CaseParser(data_dir=data_dir)
         self.retriever = None
+        self.selection_counter = 0
 
     def _log_prompt(self, stage: str, prompt: str, response: str):
         """
         Logs the prompt and response to a debug file for inspection.
         """
-        log_file = "generation_debug.log"
+        log_file = os.path.join(self.output_dir, "generation_debug.log")
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         separator = "=" * 80
 
@@ -60,20 +71,24 @@ class BaseGenerator:
         except Exception as e:
             print(f"Failed to write to log file: {e}")
 
-    def _init_retriever(self):
+    def _init_retriever(
+        self,
+        db_path="chroma_db",
+        index_dir="tantivy_index",
+        shard_assignments="data/shard_assignments.json",
+    ):
         if self.retriever:
             return
-        import chromadb
 
+        print(
+            f"Initializing CaseRetriever (DB: {db_path}, Index: {index_dir}, Assignments: {shard_assignments})..."
+        )
         try:
-            temp_client = chromadb.PersistentClient(path="chroma_db")
-            cols = [
-                c.name
-                for c in temp_client.list_collections()
-                if c.name.startswith("law_cases")
-            ]
-            target_col = cols[0] if cols else "law_cases"
-            self.retriever = CaseRetriever(collection_name=target_col)
+            self.retriever = CaseRetriever(
+                db_path=db_path,
+                index_dir=index_dir,
+                shard_assignments=shard_assignments,
+            )
         except Exception as e:
             print(f"Warning: Could not initialize retriever ({e}).")
             self.retriever = None
@@ -180,17 +195,77 @@ class BaseGenerator:
         pbar.close()
         return valid_files
 
-    def augment_queries_with_context(self, queries: List[Dict]) -> List[Dict]:
+    def _parse_structured_query(self, query_str: str) -> Dict[str, str]:
+        """
+        Parses structured queries like "KEYWORDS: ...; TIME: ...; COURT: ...; JURISDICTION: ..."
+        If no structure is found, treats the entire string as keywords.
+        """
+        params = {
+            "keywords": None,
+            "time": None,
+            "court": None,
+            "jurisdiction": None,
+        }
+
+        if not query_str:
+            return params
+
+        parts = query_str.split(";")
+        found_any_key = False
+
+        # Check if it's structured at all (has any of the known keys)
+        known_keys = {"KEYWORDS", "TIME", "COURT", "JURISDICTION"}
+
+        for part in parts:
+            if ":" in part:
+                key = part.split(":", 1)[0].strip().upper()
+                if key in known_keys:
+                    found_any_key = True
+                    break
+
+        if not found_any_key:
+            params["keywords"] = query_str.strip()
+            return params
+
+        for part in parts:
+            if ":" in part:
+                key, val = part.split(":", 1)
+                key = key.strip().upper()
+                val = val.strip()
+                if key == "KEYWORDS":
+                    params["keywords"] = val
+                elif key == "TIME":
+                    params["time"] = val
+                elif key == "COURT":
+                    params["court"] = val
+                elif key == "JURISDICTION":
+                    params["jurisdiction"] = val
+
+        return params
+
+    def augment_queries_with_context(
+        self, queries: List[Dict], focus_case_id: str = None
+    ) -> List[Dict]:
         """
         Takes a list of query items (from LLM output), performs retrieval if search_query is present,
         and returns a list of items ready for answer generation.
         """
         items_to_process = []
         for q_item in queries:
-            search_query = q_item.get("search_query")
+            search_query_raw = q_item.get("search_query")
             context_str = ""
-            if search_query and self.retriever:
-                retrieved = self.retriever.retrieve(search_query, k=4)
+
+            if search_query_raw and self.retriever:
+                parsed_params = self._parse_structured_query(search_query_raw)
+                search_query = parsed_params["keywords"]
+
+                print(
+                    f"Retrieving for query: {search_query} (Focus Case: {focus_case_id})"
+                )
+                retrieved = self.retriever.retrieve(
+                    search_query, k=4, focus_case_id=focus_case_id
+                )
+
                 for i, doc in enumerate(retrieved):
                     cid = doc["id"].split("_")[0]
                     name = doc.get("metadata", {}).get("name", "Unknown")
@@ -205,7 +280,7 @@ class BaseGenerator:
             items_to_process.append(
                 {
                     "q_item": q_item,
-                    "search_query": search_query,
+                    "search_query": search_query_raw,
                     "retrieved_context_str": context_str,
                 }
             )
@@ -216,14 +291,18 @@ class BaseGenerator:
         case_id = case_info.get("id", "unknown")
         case_name = case_info.get("name", "Unknown Case")
 
-        # Select a random style
-        selected_style = random.choice(self.QUERY_STYLES)
+        # Select style and COT using a counter to ensure even distribution
+        # one selection_counter is enough since we have 4 QUERY_STYLES and 7 COT_STRATEGIES,
+        # so this will exhaust all combinations
+        selected_style = self.QUERY_STYLES[
+            self.selection_counter % len(self.QUERY_STYLES)
+        ]
+        selected_cot = self.COT_STRATEGIES[
+            self.selection_counter % len(self.COT_STRATEGIES)
+        ]
+        self.selection_counter += 1
 
-        # Adjust distribution based on complexity bias if needed,
-        # but for now we'll stick to the base distribution with potential minor tweaks if we wanted.
         distribution = self._get_random_query_distribution()
-
-        selected_cot = random.choice(self.COT_STRATEGIES)
 
         prompt = f"""
         Your persona: {selected_style['style_name']}
@@ -234,7 +313,7 @@ class BaseGenerator:
         Reasoning Strategy: {selected_cot['prompt']}
 
         Target Distribution for this batch:
-        1. [COMPLEX] * {distribution['complex']}: Multi-step reasoning. Primary focus for '{selected_style['style_name']}' style.
+        1. [COMPLEX] * {distribution['complex']}: Multi-step reasoning.
         2. [SIMPLE] * {distribution['simple']}: Specific fact retrieval.
         3. [GENERAL] * {distribution['general']}: General legal concepts.
         4. [NEGATIVE] * {distribution['negative']}: Out-of-scope.
@@ -244,9 +323,15 @@ class BaseGenerator:
             "queries": [
                 {{
                     "type": "complex",
-                    "thought": "Step-by-step reasoning using {selected_cot['name']} strategy on what to ask...",
+                    "thought": "<thought>Initial analysis of jurisdiction...</thought><thought>Secondary check on standing requirements...</thought>",
                     "question": "...",
                     "search_query": "..."
+                }},
+                {{
+                    "type": "complex",
+                    "thought": "Thought explaining why specific keywords and optional filters (like date ranges or court levels) are chosen...",
+                    "question": "...",
+                    "search_query": "KEYWORDS: ...; (optional) TIME : ...; (optional) COURT: ...; (optional) JURISDICTION: ..."
                 }},
                 {{
                     "type": "general",
@@ -336,25 +421,28 @@ class BaseGenerator:
             "name": "IRAC_Strict",
             "prompt": "Strategy: IRAC Format. In the 'thought' field, explicitly label sections: [ISSUE], [RULE], [ANALYSIS], [CONCLUSION]. Ensure the analysis section connects specific facts to the rule.",
         },
+        {
+            "name": "Search_Keyword_Extraction",
+            "prompt": "Strategy: Professional Search Extraction. In the 'thought' field, first identify the core legal entities, then the specific cause of action, then narrow down the relevant timeline and jurisdiction if identifiable. Finally, combine these into a structured search query: 'KEYWORDS: ...; TIME: ...; COURT: ...; JURISDICTION: ...'. Note: TIME, COURT, and JURISDICTION are optional; omit them if they cannot be determined from the context.",
+        },
+        {
+            "name": "Interactive_Search",
+            "prompt": "Strategy: Client-Consultant Interaction. In the 'thought' field, reason about why you need to propose the search parameters to the user first. Propose the keywords and any relevant filters (Time, Court, Jurisdiction) if identifiable, explaining why they are relevant to the case. The model must present this as a proposal: 'I suggest searching for [Keywords] with [Filters]. Does this cover the scope of your inquiry?'",
+        },
     ]
 
     def _get_random_query_distribution(self):
         # Randomize the mix to avoid fixed patterns, but ensure negative_q is always 1
-        total = 10
+        total = 15
         negative_q = 1
 
-        # Distributed remaining 9 among complex, simple, general
+        # Distributed remaining 14 among complex, simple, general
         remaining = total - negative_q
 
-        complex_q = random.randint(3, 6)
+        complex_q = random.randint(6, 9)
         remaining -= complex_q
 
-        # Ensure at least 1 simple, and try to leave room for general
-        if remaining > 1:
-            simple_q = random.randint(1, remaining - 1)
-        else:
-            simple_q = remaining
-
+        simple_q = random.randint(1, remaining - 1)
         general_q = remaining - simple_q
 
         return {
@@ -377,6 +465,7 @@ class BaseGenerator:
             q_item = item["q_item"]
             if q_item.get("answer") and not q_item.get("search_query"):
                 # Already answered in Pass 1
+                conversations.append(None)
                 continue
 
             q_text = q_item["question"]
@@ -423,7 +512,9 @@ class BaseGenerator:
                 {"role": "user", "content": q_text},
             ]
 
-            assistant_content = f"<thought>{pass1_thought}</thought>"
+            assistant_content = self._format_thought(
+                q_item.get("thought", "Thinking...")
+            )
             if q_item.get("search_query"):
                 assistant_content += f"\n<search>{q_item['search_query']}</search>"
 
@@ -464,7 +555,19 @@ class BaseGenerator:
                     return json.loads(match.group(0))
                 except:
                     pass
-        return None
+        return {}
+
+    def _format_thought(self, thought_text: str) -> str:
+        """
+        Ensures the thought is properly wrapped in <thought> tags.
+        Supports multiple <thought> blocks if already present.
+        """
+        if not thought_text:
+            return "<thought>Thinking...</thought>"
+        thought_text = thought_text.strip()
+        if thought_text.startswith("<thought>"):
+            return thought_text
+        return f"<thought>{thought_text}</thought>"
 
     def _parse_queries_output(self, content: str) -> List[Dict]:
         self._log_prompt(
@@ -479,53 +582,99 @@ class BaseGenerator:
                     return v
         return data if isinstance(data, list) else []
 
-    def _parse_answers_output(self, content: str) -> List[Dict]:
-        self._log_prompt(
-            "Pass 2 (Answer Generation) Response", "(N/A - Response Parsing)", content
-        )
-        data = self._parse_json_robust(content)
-        if isinstance(data, dict):
-            if "answers" in data:
-                return data["answers"]
-            for v in data.values():
-                if isinstance(v, list):
-                    return v
-        return data if isinstance(data, list) else []
-
     def construct_final_messages(self, item: Dict, ans_data: Dict) -> List[Dict]:
         """
         Constructs the final list of messages for fine-tuning.
         item: dict containing 'q_item' (question), 'search_query', 'retrieved_context_str'
         ans_data: dict containing 'thought' and 'answer'
         """
-        msgs = [{"role": "user", "content": item["q_item"]["question"]}]
+        q_item = item["q_item"]
+        strategy = q_item.get("cot_strategy_name", "")
+        msgs = [{"role": "user", "content": q_item["question"]}]
 
-        thought_content = ans_data.get("thought", "").strip()
-        # Ensure thought is wrapped if not empty
-        if thought_content and not thought_content.startswith("<thought>"):
-            thought_content = f"<thought>{thought_content}</thought>"
-        elif not thought_content:
-            thought_content = "<thought>Thinking Process...</thought>"
+        # Pass 1 Thought (Stage 1 Reasoning)
+        p1_thought = self._format_thought(q_item.get("thought", ""))
 
-        if item["search_query"]:
-            # Multi-step with search
-            assistant_msg = (
-                f"{thought_content}\n<search>{item['search_query']}</search>"
+        # Pass 2 Thought (Stage 2 Reasoning)
+        p2_thought = self._format_thought(ans_data.get("thought", ""))
+
+        search_query = item.get("search_query")
+
+        if strategy == "Interactive_Search" and search_query:
+            # Multi-turn interaction simulation
+            # 1. Model proposes search
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": f"{p1_thought}\nI've analyzed your request. I propose searching for the following parameters:\n{search_query}\n\nShall I proceed with this search?",
+                }
             )
-            msgs.append({"role": "assistant", "content": assistant_msg})
+
+            # 2. User confirms or slightly adjusts (Simulated)
+            confirmation_choice = random.random()
+            if confirmation_choice < 0.7:
+                user_feedback = "Yes, please proceed."
+            else:
+                user_feedback = "That looks good, but also include any mentions of 'pre-existing conditions' if applicable."
+                # We don't actually re-run search here for the simulation consistency,
+                # but we show the model's ability to take feedback.
+
+            msgs.append({"role": "user", "content": user_feedback})
+
+            # 3. Model acknowledges and shows search
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": f"<thought>The user confirmed/refined the search. Executing now.</thought>\n<search>{search_query}</search>",
+                }
+            )
+
+            # 4. Search Results
             msgs.append(
                 {
                     "role": "user",
                     "content": f"Search Results:\n{item['retrieved_context_str']}",
                 }
             )
-            msgs.append({"role": "assistant", "content": ans_data.get("answer")})
-        else:
-            # Direct answer with thought
+
+            # 5. Final Answer
             msgs.append(
                 {
                     "role": "assistant",
-                    "content": f"{thought_content}\n{ans_data.get('answer')}",
+                    "content": f"{p2_thought}\n{ans_data.get('answer')}",
+                }
+            )
+
+        elif search_query:
+            # Standard Multi-step with search
+            # We use Stage 1 thought to justify the search
+            assistant_msg = f"{p1_thought}\n<search>{search_query}</search>"
+            msgs.append({"role": "assistant", "content": assistant_msg})
+
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": f"Search Results:\n{item.get('retrieved_context_str', 'No results found.')}",
+                }
+            )
+            # We use Stage 2 thought for the final derivation
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": f"{p2_thought}\n{ans_data.get('answer')}",
+                }
+            )
+        else:
+            # Direct answer with thought
+            # In this case, there's only one stage usually, but if two stages were used:
+            combined_thought = p1_thought
+            if p2_thought:
+                combined_thought += f"\n{p2_thought}"
+
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": f"{combined_thought}\n{ans_data.get('answer')}",
                 }
             )
         return msgs

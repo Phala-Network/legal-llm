@@ -12,64 +12,34 @@ import sys
 # Add project root to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.data_gen.base_generator import BaseGenerator
+from src.utils.path_utils import normalize_case_path
 
 
-class BatchManager:
-    def __init__(self, client):
-        self.client = client
-
-    def upload_file(self, file_path: str, purpose: str = "batch") -> str:
-        print(f"Uploading {file_path} to OpenAI...")
-        with open(file_path, "rb") as f:
-            response = self.client.files.create(file=f, purpose=purpose)
-        print(f"File uploaded. ID: {response.id}")
-        return response.id
-
-    def create_batch(self, input_file_id: str, description: str = "Batch Job") -> str:
-        print(f"Creating Batch for File ID: {input_file_id}...")
-        response = self.client.batches.create(
-            input_file_id=input_file_id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h",
-            metadata={"description": description},
-        )
-        print(f"Batch created. ID: {response.id}")
-        return response.id
-
-    def wait_for_batch(self, batch_id: str, poll_interval: int = 60) -> str:
-        print(
-            f"Waiting for Batch {batch_id} to complete. Polling every {poll_interval}s..."
-        )
-        while True:
-            batch = self.client.batches.retrieve(batch_id)
-            if batch.status == "completed":
-                return batch.output_file_id
-            elif batch.status in ["failed", "cancelled", "expired"]:
-                if hasattr(batch, "errors") and batch.errors:
-                    print(f"Errors: {batch.errors}")
-                raise Exception(f"Batch failed: {batch.status}")
-            time.sleep(poll_interval)
-
-    def download_file(self, file_id: str, output_path: str):
-        print(f"Downloading File {file_id} to {output_path}...")
-        content = self.client.files.content(file_id).read()
-        with open(output_path, "wb") as f:
-            f.write(content)
-        print("Download complete.")
+from src.utils.batch_utils import BatchManager
 
 
 class DataGenerator(BaseGenerator):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.batch_manager = BatchManager(self.client)
+        self.rag_params = {
+            "db_path": kwargs.get("db_path", "chroma_db"),
+            "index_dir": kwargs.get("index_dir", "tantivy_index"),
+            "shard_assignments": kwargs.get(
+                "shard_assignments", "data/shard_assignments.json"
+            ),
+        }
 
     def run_pipeline(self, num_samples: int):
         pid = uuid.uuid4().hex[:8]
         print(f"Starting Automated Pipeline {pid}...")
 
-        f1_in, f1_out = f"batch_{pid}_s1_in.jsonl", f"batch_{pid}_s1_out.jsonl"
-        f2_in, f2_out = f"batch_{pid}_s2_in.jsonl", f"batch_{pid}_s2_out.jsonl"
-        m1, m2 = f"batch_{pid}_m1.json", f"batch_{pid}_m2.json"
+        f1_in = os.path.join(self.output_dir, f"batch_{pid}_s1_in.jsonl")
+        f1_out = os.path.join(self.output_dir, f"batch_{pid}_s1_out.jsonl")
+        f2_in = os.path.join(self.output_dir, f"batch_{pid}_s2_in.jsonl")
+        f2_out = os.path.join(self.output_dir, f"batch_{pid}_s2_out.jsonl")
+        m1 = os.path.join(self.output_dir, f"batch_{pid}_m1.json")
+        m2 = os.path.join(self.output_dir, f"batch_{pid}_m2.json")
 
         # Stage 1: Queries
         print("\n=== STAGE 1: Generating Queries ===")
@@ -121,7 +91,7 @@ class DataGenerator(BaseGenerator):
     ):
         with open(m1, "r") as f:
             q_map = json.load(f)
-        self._init_retriever()
+        self._init_retriever(**self.rag_params)
         meta2 = {}
         with open(in_file, "r") as f_in, open(out_file, "w") as f_out:
             for line in f_in:
@@ -133,11 +103,19 @@ class DataGenerator(BaseGenerator):
                 content = res["response"]["body"]["choices"][0]["message"]["content"]
 
                 # Meta is now a dict {path: ..., strategy: ...}
-                case_info = self._get_case_text(q_map[cid]["path"])
+                case_path = q_map[cid]["path"]
+                case_info = self._get_case_text(case_path)
                 strategy = q_map[cid]["strategy"]
 
+                # For focus_case_id we need normalized path relative to data_dir
+                # BaseGenerator keeps data_dir in self.data_dir
+                rel_path = os.path.relpath(case_path, self.data_dir)
+                norm_path = normalize_case_path(rel_path)
+
                 queries = self._parse_queries_output(content)
-                items = self.augment_queries_with_context(queries)
+                items = self.augment_queries_with_context(
+                    queries, focus_case_id=norm_path
+                )
 
                 # Prepare Stage 2 requests (Fan-Out)
                 # Call construct_answer_conversations which returns List[List[Dict]] (list of conversations)
@@ -151,7 +129,7 @@ class DataGenerator(BaseGenerator):
                 )
 
                 for i, messages in enumerate(conversations):
-                    if not messages:
+                    if messages is None:
                         continue
 
                     ans_cid = f"ans-{uuid.uuid4()}"
@@ -243,9 +221,34 @@ if __name__ == "__main__":
         default="batch_map_next.json",
         help="Next stage metadata map file",
     )
+    parser.add_argument(
+        "--db_path", type=str, default="chroma_db", help="Chroma DB path"
+    )
+    parser.add_argument(
+        "--index_dir", type=str, default="tantivy_index", help="Tantivy index directory"
+    )
+    parser.add_argument(
+        "--shard_assignments",
+        type=str,
+        default="data/shard_assignments.json",
+        help="Shard assignments JSON path",
+    )
+    parser.add_argument(
+        "--data_dir", type=str, default="data", help="Cases data directory"
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default=".", help="Directory for all output files"
+    )
 
     args = parser.parse_args()
-    gen = DataGenerator(output_file=args.output_file)
+    gen = DataGenerator(
+        output_file=args.output_file,
+        output_dir=args.output_dir,
+        db_path=args.db_path,
+        index_dir=args.index_dir,
+        shard_assignments=args.shard_assignments,
+        data_dir=args.data_dir,
+    )
 
     if args.pipeline:
         gen.run_pipeline(args.num_samples)

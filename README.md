@@ -74,7 +74,10 @@ uv run src/scripts/download_reporter.py --reporter cal-rptr-3d --max_volumes 5
 For large datasets (6.9M+), analyze citation neighborhoods to optimize vector DB performance.
 
 ```bash
-uv run src/scripts/analyze_case_neighborhoods.py --base_dir data --search_dir data --output data/case_neighborhoods.json
+uv run src/scripts/analyze_case_neighborhoods.py \
+    --base_dir data \
+    --search_dir data \
+    --output test_run/shard_assignments.json
 ```
 
 ### 3. Unified Ingestion (Sharding -> Vector DB -> Router Index)
@@ -86,14 +89,26 @@ Place your case law JSONs in `data/` and run the unified ingester. This script p
 3. **Builds a Global Router Index** (Tantivy) for full-text routing.
 
 ```bash
-uv run src/rag/ingest.py --data_dir data --assignments data/shard_assignments.json --db_path chroma_db --index_dir tantivy_index --batch_dir .
+# Ingest data into a standalone 'test_run/' directory
+uv run src/rag/ingest.py \
+    --data_dir data \
+    --assignments test_run/shard_assignments.json \
+    --db_path test_run/chroma_db \
+    --index_dir test_run/tantivy_index \
+    --batch_dir test_run
 ```
 
 **Tip: Testing on a subset**:
 To verify the pipeline before a full run, use `--search_dir` to only ingest a specific reporter or volume:
 
 ```bash
-uv run src/rag/ingest.py --data_dir data --search_dir data/us/1 --assignments data/shard_assignments.json --db_path test_run/chroma_db --index_dir test_run/tantivy_index --batch_dir test_run
+uv run src/rag/ingest.py \
+    --data_dir data \
+    --search_dir data/us/1 \
+    --assignments test_run/shard_assignments.json \
+    --db_path test_run/chroma_db \
+    --index_dir test_run/tantivy_index \
+    --batch_dir test_run
 ```
 
 ### 4. Integrated Retrieval (End-to-End)
@@ -103,14 +118,23 @@ The `CaseRetriever` now handles the entire two-stage retrieval process internall
 **End-to-End Search**:
 
 ```bash
-uv run src/rag/retriever.py --db_path chroma_db --index_dir tantivy_index "your search"
+uv run src/rag/retriever.py \
+    --db_path test_run/chroma_db \
+    --index_dir test_run/tantivy_index \
+    --assignments test_run/shard_assignments.json \
+    "locomotive brakes livestock"
 ```
 
 **Focused Search (Neighborhood Aware)**:
 If you know the specific case context, you can focus the search on its citation neighborhood shard:
 
 ```bash
-uv run src/rag/retriever.py "your search" --focus "us/1/0001-01"
+uv run src/rag/retriever.py \
+    --db_path test_run/chroma_db \
+    --index_dir test_run/tantivy_index \
+    --assignments test_run/shard_assignments.json \
+    --focus "us/1/0001-01" \
+    "locomotive brakes livestock"
 ```
 
 **How it works**:
@@ -130,10 +154,17 @@ Choose between direct generation or the batch pipeline (recommended for large sc
 uv run src/data_gen/generate.py --num_samples 50
 ```
 
-**Batch Pipeline**:
+**Batch Pipeline (Parallel & Low Cost)**:
+The recommended way for large scale. All intermediate files and logs will be stored in `--output_dir`.
 
 ```bash
-uv run src/data_gen/generate_batch.py --pipeline --num_samples 1000
+uv run src/data_gen/generate_batch.py \
+    --pipeline \
+    --num_samples 1000 \
+    --output_dir test_run/generation \
+    --db_path test_run/chroma_db \
+    --index_dir test_run/tantivy_index \
+    --shard_assignments test_run/shard_assignments.json
 ```
 
 ### 6. Fine-tune Model
@@ -141,7 +172,7 @@ uv run src/data_gen/generate_batch.py --pipeline --num_samples 1000
 Train the model using the generated `training_data.jsonl`.
 
 ```bash
-uv run src/finetune/train.py
+uv run src/finetune/train.py --train_data test_run/generation/training_data.jsonl
 ```
 
 ### 7. Run Inference

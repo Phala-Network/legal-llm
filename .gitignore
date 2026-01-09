@@ -21,6 +21,7 @@ processed_files.txt
 
 tantivy_index*/
 chroma_db*/
+test_run/
 
 /*.json
 /*.jsonl
