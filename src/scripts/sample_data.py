@@ -72,6 +72,8 @@ def sample(
     num_samples: int = 100,
     since_year: Optional[int] = None,
     min_length: int = 3000,
+    include_citations: bool = True,
+    exclude_paths: Optional[Set[str]] = None,
 ):
     """
     Samples cases using filter_cases_by_date and ensuring jurisdiction diversity.
@@ -117,6 +119,9 @@ def sample(
                 rep_path, start_date=start_date_str, min_content_length=min_length
             )
 
+            if exclude_paths:
+                candidate_files = [f for f in candidate_files if f not in exclude_paths]
+
             if not candidate_files:
                 continue
 
@@ -158,15 +163,19 @@ def sample(
         rel = copy_file(root_path)
         root_case_rel_paths.append(rel)
 
-        try:
-            with open(root_path, "r", encoding="utf-8") as f:
-                case_data = json.load(f)
-            cited_files = get_cited_case_paths(case_data, data_dir)
-            for c in cited_files:
-                if os.path.exists(c):
-                    copy_file(c)
-        except Exception as e:
-            print(f"Error resolving citations for {root_path}: {e}")
+        if include_citations:
+            try:
+                with open(root_path, "r", encoding="utf-8") as f:
+                    case_data = json.load(f)
+                cited_files = get_cited_case_paths(case_data, data_dir)
+                for c in cited_files:
+                    if os.path.exists(c):
+                        copy_file(c)
+            except Exception as e:
+                print(f"Error resolving citations for {root_path}: {e}")
+        else:
+            # We skip citation resolving as requested
+            pass
 
         if (i + 1) % 10 == 0:
             print(f"Processed {i+1}/{len(root_cases_found)} root cases...")
@@ -199,11 +208,37 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", type=str, default="data_sample", help="Output directory."
     )
+    parser.add_argument(
+        "--no_citations",
+        action="store_false",
+        dest="include_citations",
+        help="Only copy root cases, disable citation tracking.",
+    )
+    parser.set_defaults(include_citations=True)
+    parser.add_argument(
+        "--exclude_json",
+        type=str,
+        default=None,
+        help="Path to a previous root_cases.json to exclude those cases from sampling.",
+    )
 
     args = parser.parse_args()
 
     DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
     OUTPUT_ROOT = os.path.join(PROJECT_ROOT, args.output)
+
+    exclude_paths = set()
+    if args.exclude_json:
+        if os.path.exists(args.exclude_json):
+            with open(args.exclude_json, "r", encoding="utf-8") as f:
+                rel_paths = json.load(f)
+                for rp in rel_paths:
+                    exclude_paths.add(os.path.abspath(os.path.join(DATA_ROOT, rp)))
+            print(
+                f"Loaded {len(exclude_paths)} paths to exclude from {args.exclude_json}"
+            )
+        else:
+            print(f"Warning: Exclude JSON not found at {args.exclude_json}")
 
     sample(
         DATA_ROOT,
@@ -211,4 +246,6 @@ if __name__ == "__main__":
         num_samples=args.num_samples,
         since_year=args.since_year,
         min_length=args.min_length,
+        include_citations=args.include_citations,
+        exclude_paths=exclude_paths,
     )
