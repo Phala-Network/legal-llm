@@ -11,6 +11,7 @@ import tantivy
 import concurrent.futures
 import threading
 import sys
+import time
 
 # Add project root to path to ensure imports work if run directly
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -43,8 +44,14 @@ class CaseIngester:
             "EMBEDDING_MODEL_NAME", "openai/text-embedding-3-large"
         )
         self.collections = {}  # Cache loaded collections: name -> collection_obj
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=50
+        )  # High for I/O
+        self.parse_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count() or 4
+        )
         self.collection_lock = threading.Lock()
+        self.chroma_lock = threading.Lock()  # Lock for PersistentClient writes
 
         # Initialize Parser
         self.parser = CaseParser(data_dir=data_dir)
@@ -149,6 +156,82 @@ class CaseIngester:
         index = tantivy.Index(schema, path=self.index_dir)
         return index, index.writer()
 
+    def _get_case_data(self, json_file):
+        """
+        Loads and parses a case file, returning essential data and chunks.
+        """
+        rel_path = os.path.relpath(json_file, self.data_dir)
+        case_id_path = normalize_case_path(rel_path)
+
+        # Check shards
+        target_shards = self.shard_manager.get_shards_for_case(case_id_path)
+        if not target_shards:
+            return None
+
+        case_data = self.load_case_json(json_file)
+        parsed = self.parser.parse_case_structure(case_data)
+
+        # Extract basic info
+        name = case_data.get("name_abbreviation", case_data.get("name", "Unknown"))
+        date = case_data.get("decision_date", "Unknown")
+        citation = str(case_data.get("citations", [{}])[0].get("cite", ""))
+        jurisdiction = case_data.get("jurisdiction", {}).get("name_long", "Unknown")
+        cid_int = int(case_data["id"])
+
+        chunks = self.chunk_text(parsed, name, date)
+
+        return {
+            "case_id_path": case_id_path,
+            "target_shards": target_shards,
+            "target_collections": [f"shard_{s:03d}" for s in target_shards],
+            "case_id_internal": cid_int,
+            "name": name,
+            "date": date,
+            "citation": citation,
+            "jurisdiction": jurisdiction,
+            "parsed_structure": parsed,
+            "chunks": chunks,
+            "file_path": json_file,
+        }
+
+    def _build_tantivy_index(self, json_files):
+        """
+        Standalone method to build the Tantivy search index.
+        """
+        print("Building search index...")
+        tantivy_index, tantivy_writer = self.setup_tantivy()
+
+        for json_file in tqdm(json_files, desc="Indexing Tantivy"):
+            try:
+                # We need some of the data even for Tantivy
+                case_data = self.load_case_json(json_file)
+                rel_path = os.path.relpath(json_file, self.data_dir)
+                case_id_path = normalize_case_path(rel_path)
+
+                cid_int = int(case_data["id"])
+                name = case_data.get(
+                    "name_abbreviation", case_data.get("name", "Unknown")
+                )
+
+                parsed_structure = self.parser.parse_case_structure(case_data)
+                head_matter = parsed_structure.get("head_matter", "")
+                content_blocks = parsed_structure.get("content_blocks", [])
+                full_text = head_matter + "\n" + "\n".join(content_blocks)
+
+                tantivy_writer.add_document(
+                    tantivy.Document(
+                        title=name,
+                        body=full_text,
+                        case_id=cid_int,
+                        slug=case_id_path,
+                    )
+                )
+            except Exception as e:
+                print(f"Skipping {json_file} for Tantivy: {e}")
+
+        tantivy_writer.commit()
+        print("Tantivy index built successfully.")
+
     def ingest(
         self,
         search_dir: str = None,
@@ -159,7 +242,6 @@ class CaseIngester:
         scan_dir = search_dir or self.data_dir
 
         # 1. Shard Assignment Generation
-        # Only generate if they don't exist yet
         print("Loading shard assignments...")
         already_loaded = self.shard_manager.load_assignments()
 
@@ -185,116 +267,67 @@ class CaseIngester:
         json_files = [f for f in json_files if "Metadata" not in f]
         print(f"Found {len(json_files)} case files.")
 
-        if tantivy_only:
-            print("Tantivy Only Mode: Building search index...")
-            tantivy_index, tantivy_writer = self.setup_tantivy()
-            for json_file in tqdm(json_files, desc="Indexing Tantivy"):
-                try:
-                    rel_path = os.path.relpath(json_file, self.data_dir)
-                    case_id_for_shard = normalize_case_path(rel_path)
-                    case_data = self.load_case_json(json_file)
-                    case_id_internal = int(case_data["id"])
-                    name = case_data.get(
-                        "name_abbreviation", case_data.get("name", "Unknown")
-                    )
-                    parsed_structure = self.parser.parse_case_structure(case_data)
-                    head_matter = parsed_structure.get("head_matter", "")
-                    content_blocks = parsed_structure.get("content_blocks", [])
-                    full_text = head_matter + "\n" + "\n".join(content_blocks)
+        # 2. Build Tantivy Index (Background)
+        tantivy_future = self.executor.submit(self._build_tantivy_index, json_files)
 
-                    tantivy_writer.add_document(
-                        tantivy.Document(
-                            title=name,
-                            body=full_text,
-                            case_id=case_id_internal,
-                            slug=case_id_for_shard,
-                        )
-                    )
-                except Exception as e:
-                    print(f"Skipping {json_file} for Tantivy: {e}")
-            tantivy_writer.commit()
-            print("Tantivy index built successfully.")
+        if tantivy_only:
+            tantivy_future.result()
             return
 
+        # 3. Handle Embeddings
         if batch_mode:
             self.submit_batch_ingestion(json_files)
-            return
+        else:
+            self._ingest_sync(json_files)
 
-        # 2. Setup Tantivy
-        tantivy_index, tantivy_writer = self.setup_tantivy()
+        # Wait for Tantivy at the end if it's still running
+        print("Waiting for search index to complete...")
+        tantivy_future.result()
+        print("Ingestion flow complete.")
 
+    def _ingest_sync(self, json_files):
+        """
+        High-performance synchronous ingestion for ChromaDB.
+        """
+        start_time = time.time()
         batches = {}  # "collection_name" -> {ids: [], docs: [], metas: []}
-        batch_size = 50
+        batch_size = 500
         futures = []
 
-        for json_file in tqdm(json_files):
-            try:
-                # Determine case ID and assigned shards
-                rel_path = os.path.relpath(json_file, self.data_dir)
-                case_id_for_shard = normalize_case_path(rel_path)
+        # Step 1: Parallel Parsing
+        print("Parsing cases in parallel...")
+        parse_futures = [
+            self.parse_executor.submit(self._get_case_data, f) for f in json_files
+        ]
 
-                target_shards = self.shard_manager.get_shards_for_case(
-                    case_id_for_shard
-                )
-                if not target_shards:
-                    print(
-                        f"Warning: No shards assigned for {case_id_for_shard}. Skipping."
-                    )
+        for future in tqdm(
+            concurrent.futures.as_completed(parse_futures),
+            total=len(parse_futures),
+            desc="Parsing Cases",
+        ):
+            try:
+                data = future.result()
+                if not data:
                     continue
 
-                target_collection_names = [f"shard_{s:03d}" for s in target_shards]
-
-                # Extract and parse case data
-                case_data = self.load_case_json(json_file)
-                jurisdiction = case_data.get("jurisdiction", {}).get(
-                    "name_long", "Unknown"
-                )
-                case_id_internal = int(case_data["id"])
-                name = case_data.get(
-                    "name_abbreviation", case_data.get("name", "Unknown")
-                )
-                date = case_data.get("decision_date", "Unknown")
-                citation = str(case_data.get("citations", [{}])[0].get("cite", ""))
-
-                parsed_structure = self.parser.parse_case_structure(case_data)
-
-                # Add to Tantivy Index
-                head_matter = parsed_structure.get("head_matter", "")
-                content_blocks = parsed_structure.get("content_blocks", [])
-                full_text_for_index = head_matter + "\n" + "\n".join(content_blocks)
-
-                tantivy_writer.add_document(
-                    tantivy.Document(
-                        title=name,
-                        body=full_text_for_index,
-                        case_id=case_id_internal,
-                        slug=case_id_for_shard,
-                    )
-                )
-
-                # Chunk for Vector DB
-                chunks = self.chunk_text(parsed_structure, name, date)
-
                 # Add to batches for each assigned shard
-                for col_key in target_collection_names:
-                    self.get_collection(col_key)  # Ensure exists
-
+                for col_key in data["target_collections"]:
                     if col_key not in batches:
                         batches[col_key] = {"ids": [], "docs": [], "metas": []}
 
-                    for i, chunk in enumerate(chunks):
-                        doc_id = f"{case_id_internal}_{i}"
+                    for i, chunk in enumerate(data["chunks"]):
+                        doc_id = f"{data['case_id_internal']}_{i}"
 
                         batches[col_key]["ids"].append(doc_id)
                         batches[col_key]["docs"].append(chunk)
                         batches[col_key]["metas"].append(
                             {
-                                "case_id": str(case_id_internal),
-                                "path_id": case_id_for_shard,
-                                "name": name,
-                                "state": jurisdiction,
-                                "citation": citation,
-                                "file_path": json_file,
+                                "case_id": str(data["case_id_internal"]),
+                                "path_id": data["case_id_path"],
+                                "name": data["name"],
+                                "state": data["jurisdiction"],
+                                "citation": data["citation"],
+                                "file_path": data["file_path"],
                                 "chunk_index": i,
                             }
                         )
@@ -307,40 +340,42 @@ class CaseIngester:
                                     self._flush_batch, col_key, batch_copy
                                 )
                             )
-
             except Exception as e:
-                print(f"Skipping {json_file}: {e}")
+                print(f"Error parsing case: {e}")
 
-        # Final commit and flush
-        print("Finishing Tantivy index and remaining vector batches...")
-        tantivy_writer.commit()
-
+        # Final flush preparation
         for col_key, batch_data in batches.items():
             if batch_data["ids"]:
                 futures.append(
                     self.executor.submit(self._flush_batch, col_key, batch_data)
                 )
 
-        print("Waiting for pending embeddings...")
+        print(f"Waiting for {len(futures)} embedding/upsert batches...")
         for f in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
             pass
 
-        print("Ingestion complete.")
+        end_time = time.time()
+        print(f"Sync Ingestion complete in {end_time - start_time:.2f} seconds.")
 
     def _flush_batch(self, col_name, batch_data):
         try:
-            col = self.chroma_client.get_collection(name=col_name)
+            # Embedding calculation (I/O)
             resp = self.client.embeddings.create(
                 input=batch_data["docs"], model=self.embedding_model_name
             )
             embeddings = [d.embedding for d in resp.data]
 
-            col.upsert(
-                ids=batch_data["ids"],
-                documents=batch_data["docs"],
-                metadatas=batch_data["metas"],
-                embeddings=embeddings,
-            )
+            # Upsert into Chroma (Disk I/O / SQLite)
+            # We use a lock here to prevent SQLite "database is locked" errors
+            # while still allowing many threads to calculate embeddings in parallel.
+            with self.chroma_lock:
+                col = self.get_collection(col_name)
+                col.upsert(
+                    ids=batch_data["ids"],
+                    documents=batch_data["docs"],
+                    metadatas=batch_data["metas"],
+                    embeddings=embeddings,
+                )
         except Exception as e:
             print(f"Batch Error for {col_name}: {e}")
 
@@ -362,35 +397,24 @@ class CaseIngester:
         count = 0
         file_idx = 1
 
-        for json_file in tqdm(json_files):
-            try:
-                rel_path = os.path.relpath(json_file, self.data_dir)
-                case_id_path = normalize_case_path(rel_path)
+        # Step 1: Parallel Parsing
+        print("Parsing cases in parallel for batch submission...")
+        parse_futures = [
+            self.parse_executor.submit(self._get_case_data, f) for f in json_files
+        ]
 
-                # Check shards
-                target_shards = self.shard_manager.get_shards_for_case(case_id_path)
-                if not target_shards:
+        for future in tqdm(
+            concurrent.futures.as_completed(parse_futures),
+            total=len(parse_futures),
+            desc="Preparing Chunks",
+        ):
+            try:
+                data = future.result()
+                if not data:
                     continue
 
-                target_collections = [f"shard_{s:03d}" for s in target_shards]
-
-                case_data = self.load_case_json(json_file)
-                parsed = self.parser.parse_case_structure(case_data)
-
-                name = case_data.get(
-                    "name_abbreviation", case_data.get("name", "Unknown")
-                )
-                date = case_data.get("decision_date", "Unknown")
-                citation = str(case_data.get("citations", [{}])[0].get("cite", ""))
-                jurisdiction = case_data.get("jurisdiction", {}).get(
-                    "name_long", "Unknown"
-                )
-                cid_int = int(case_data["id"])
-
-                chunks = self.chunk_text(parsed, name, date)
-
-                for i, chunk in enumerate(chunks):
-                    doc_id = f"{cid_int}_{i}"
+                for i, chunk in enumerate(data["chunks"]):
+                    doc_id = f"{data['case_id_internal']}_{i}"
                     custom_id = f"req-{doc_id}"
 
                     # Store metadata required for ingestion later
@@ -399,14 +423,14 @@ class CaseIngester:
                         "doc_id": doc_id,
                         "chunk_index": i,
                         "text": chunk,
-                        "target_collections": target_collections,
+                        "target_collections": data["target_collections"],
                         "metadata": {
-                            "case_id": str(cid_int),
-                            "path_id": case_id_path,
-                            "name": name,
-                            "state": jurisdiction,
-                            "citation": citation,
-                            "file_path": json_file,
+                            "case_id": str(data["case_id_internal"]),
+                            "path_id": data["case_id_path"],
+                            "name": data["name"],
+                            "state": data["jurisdiction"],
+                            "citation": data["citation"],
+                            "file_path": data["file_path"],
                             "chunk_index": i,
                         },
                     }
@@ -439,7 +463,7 @@ class CaseIngester:
                         file_idx += 1
 
             except Exception as e:
-                print(f"Skipping {json_file}: {e}")
+                print(f"Error parsing case: {e}")
 
         # Flush remaining
         if requests:
@@ -522,51 +546,48 @@ class CaseIngester:
         buffer = {}
         processed_count = 0
 
-        # We skip JSONL loading here for memory, but for progress bar we might need length
-        # Open once to count if possible, or just line by line
+        # Use a streaming approach instead of readlines() to save memory
         with open(local_file, "r") as f:
-            lines = f.readlines()
+            for line in tqdm(f, desc=f"Ingesting {batch_id}", unit="emb"):
+                try:
+                    res = json.loads(line)
+                    cid = res["custom_id"]
 
-        for line in tqdm(lines, desc=f"Ingesting {batch_id}", unit="emb"):
-            try:
-                res = json.loads(line)
-                cid = res["custom_id"]
+                    if res.get("error"):
+                        print(f"Error in result {cid}: {res['error']}")
+                        continue
 
-                if res.get("error"):
-                    print(f"Error in result {cid}: {res['error']}")
-                    continue
+                    if cid not in meta_lookup:
+                        print(f"Warning: Unknown custom_id {cid}")
+                        continue
 
-                if cid not in meta_lookup:
-                    print(f"Warning: Unknown custom_id {cid}")
-                    continue
+                    meta_entry = meta_lookup[cid]
+                    embedding = res["response"]["body"]["data"][0]["embedding"]
 
-                meta_entry = meta_lookup[cid]
-                embedding = res["response"]["body"]["data"][0]["embedding"]
+                    # Each chunk might go to multiple shard collections
+                    for col_name in meta_entry["target_collections"]:
+                        if col_name not in buffer:
+                            buffer[col_name] = {
+                                "ids": [],
+                                "embeddings": [],
+                                "metadatas": [],
+                                "documents": [],
+                            }
 
-                # Each chunk might go to multiple shard collections
-                for col_name in meta_entry["target_collections"]:
-                    if col_name not in buffer:
-                        buffer[col_name] = {
-                            "ids": [],
-                            "embeddings": [],
-                            "metadatas": [],
-                            "documents": [],
-                        }
+                        buffer[col_name]["ids"].append(meta_entry["doc_id"])
+                        buffer[col_name]["embeddings"].append(embedding)
+                        buffer[col_name]["metadatas"].append(meta_entry["metadata"])
+                        buffer[col_name]["documents"].append(meta_entry["text"])
 
-                    buffer[col_name]["ids"].append(meta_entry["doc_id"])
-                    buffer[col_name]["embeddings"].append(embedding)
-                    buffer[col_name]["metadatas"].append(meta_entry["metadata"])
-                    buffer[col_name]["documents"].append(meta_entry["text"])
+                    processed_count += 1
 
-                processed_count += 1
-
-                if processed_count % 1000 == 0:
-                    self._flush_chroma_buffer(buffer)
-                    buffer = (
-                        {}
-                    )  # Reset specific collections? No, reset all to keep memory low
-            except Exception as e:
-                print(f"Error processing line in {local_file}: {e}")
+                    # Flush every 2000 processed entries to balance memory and batch speed
+                    if processed_count % 2000 == 0:
+                        with self.chroma_lock:
+                            self._flush_chroma_buffer(buffer)
+                        buffer = {}
+                except Exception as e:
+                    print(f"Error processing line in {local_file}: {e}")
 
         # Final flush
         self._flush_chroma_buffer(buffer)
